@@ -138,7 +138,8 @@ function renderSignIn() {
     <form class="center" id="signin">
       <div style="text-align:center"><div class="wordmark" style="font-size:32px">La Habana<span>Staff</span></div></div>
       <label class="lbl" for="em">Work email</label>
-      <input id="em" type="email" autocomplete="username" required inputmode="email" placeholder="you@lahabana.mv">
+      <input id="em" type="email" autocomplete="username" required inputmode="email"
+             autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="you@lahabana.mv">
       <label class="lbl" for="pw">Password</label>
       <input id="pw" type="password" autocomplete="current-password" required>
       <button class="btn" type="submit">Sign in</button>
@@ -147,12 +148,42 @@ function renderSignIn() {
     </form>`;
   $("signin").addEventListener("submit", async e => {
     e.preventDefault(); busy(true);
-    const { error } = await sb.auth.signInWithPassword({ email: $("em").value.trim(), password: $("pw").value });
+    const { error } = await sb.auth.signInWithPassword({
+      email: $("em").value.trim().toLowerCase(), password: $("pw").value
+    });
     busy(false);
-    if (error) return toast("That email and password don't match.", true);
+    if (error) return signInProblem(error);
     boot();
   });
 }
+function signInProblem(error) {
+  var raw = (error && error.message) || "";
+  var low = raw.toLowerCase();
+  if (low.indexOf("not confirmed") > -1) {
+    return sheet('<div style="font-weight:600;font-size:18px">This account isn\'t confirmed yet</div>' +
+      '<p class="sm mut" style="margin:0">Supabase made the account but is still waiting for the email to be verified, so it won\'t let anyone in.</p>' +
+      '<p class="sm" style="margin:0">Fix it once, in Supabase:</p>' +
+      '<p class="sm mut" style="margin:0">1. <b>Authentication → Sign In / Providers → Email</b>: turn <b>Confirm email</b> OFF.</p>' +
+      '<p class="sm mut" style="margin:0">2. <b>Authentication → Users</b>: open this person\'s row and confirm them, or delete and add them again with auto-confirm ticked.</p>' +
+      '<button class="btn sec" data-act="closesheet">Got it</button>');
+  }
+  if (low.indexOf("invalid login") > -1) {
+    return sheet('<div style="font-weight:600;font-size:18px">Email or password is wrong</div>' +
+      '<p class="sm mut" style="margin:0">Supabase has no account with exactly this email and password.</p>' +
+      '<p class="sm mut" style="margin:0">• Check for a typo or a stray space, and that the phone hasn\'t capitalised the first letter.</p>' +
+      '<p class="sm mut" style="margin:0">• If your browser filled the password in for you, clear it and type it by hand.</p>' +
+      '<p class="sm mut" style="margin:0">• Still stuck? In Supabase, <b>Authentication → Users</b>, set a new password on the account.</p>' +
+      '<button class="btn sec" data-act="closesheet">Got it</button>');
+  }
+  if (low.indexOf("rate") > -1 || low.indexOf("too many") > -1) {
+    return toast("Too many tries in a row. Wait a minute, then try again.", true);
+  }
+  return sheet('<div style="font-weight:600;font-size:18px">Couldn\'t sign in</div>' +
+    '<p class="sm mut" style="margin:0">Supabase said:</p>' +
+    '<p class="sm mono" style="margin:0;overflow-wrap:anywhere">' + esc(raw || "no reason given") + '</p>' +
+    '<button class="btn sec" data-act="closesheet">Close</button>');
+}
+ 
 function renderProfileSetup() {
   $("tabbar").hidden = true;
   screenEl().innerHTML = `
