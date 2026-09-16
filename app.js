@@ -1,4 +1,8 @@
-*/
+/* =====================================================================
+   La Habana Staff — app
+   Talks to Supabase. Every rule that matters (who sees what, where you
+   can clock in from, what time it is) is enforced by the database.
+   ===================================================================== */
 "use strict";
  
 /* Accepts what people actually paste: a trailing slash, the dashboard link,
@@ -82,6 +86,15 @@ function sheet(html) {
 const closeSheet = () => document.querySelectorAll(".sheet").forEach(s => s.remove());
 const busy = on => { S.busy = on; document.querySelectorAll(".btn").forEach(b => b.disabled = on); };
 const spinner = '<div class="center"><div class="spin"></div></div>';
+/* Nothing is allowed to hang forever: if Supabase doesn't answer, we say so. */
+function withTimeout(p, ms, label) {
+  return Promise.race([
+    Promise.resolve(p),
+    new Promise(function (_, reject) {
+      setTimeout(function () { reject(new Error(label || "Supabase didn't answer in " + Math.round(ms / 1000) + " seconds")); }, ms);
+    })
+  ]);
+}
  
 /* ---------- start up -------------------------------------------------- */
 (async function start() {
@@ -92,8 +105,12 @@ const spinner = '<div class="center"><div class="spin"></div></div>';
   }
   const params = new URLSearchParams(location.search);
   if (params.get("site")) { S.pendingSite = params.get("site"); history.replaceState({}, "", location.pathname); }
-  const { data } = await sb.auth.getSession();
-  if (data.session) await boot(); else renderSignIn();
+  let session = null;
+  try {
+    const res = await withTimeout(sb.auth.getSession(), 8000, "getSession timed out");
+    session = res && res.data && res.data.session;
+  } catch (e) { session = null; }
+  if (session) await boot(); else renderSignIn();
   sb.auth.onAuthStateChange((e) => { if (e === "SIGNED_OUT") { S.me = null; renderSignIn(); } });
   if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
 })();
@@ -106,7 +123,8 @@ async function boot() {
       '<div class="card stack"><p class="sm" style="margin:0">The app opened, but Supabase didn\'t answer. Nearly always one of these:</p>' +
       '<p class="sm" style="margin:0">• The two values in <b>config.js</b> don\'t match your project (Supabase → Project Settings → API).</p>' +
       '<p class="sm" style="margin:0">• The database script hasn\'t been run yet, so the tables don\'t exist.</p>' +
-      '<p class="sm" style="margin:0">• The project is paused — open it in Supabase and press Restore.</p>' +
+      '<p class="sm" style="margin:0">• The project is paused or still starting — open it in Supabase and press Restore.</p>' +
+      '<p class="sm" style="margin:0">• Your phone lost the internet halfway through.</p>' +
       '<p class="xs mono mut" style="margin:0;overflow-wrap:anywhere">' + esc(e && e.message ? e.message : e) + '</p></div>' +
       '<button class="btn" data-act="reload">Try again</button>' +
       '<button class="btn sec" data-act="signout">Sign out</button></div>';
@@ -114,14 +132,14 @@ async function boot() {
 }
 async function bootInner() {
   screenEl().innerHTML = spinner;
-  const { data: { user } } = await sb.auth.getUser();
+  const { data: { user } } = await withTimeout(sb.auth.getUser(), 12000, "Supabase didn't answer when checking who you are.");
   if (!user) return renderSignIn();
-  const [{ data: prof }, { data: people }, { data: settings }, { data: types }] = await Promise.all([
+  const [{ data: prof }, { data: people }, { data: settings }, { data: types }] = await withTimeout(Promise.all([
     sb.from("profiles").select("*").eq("id", user.id).maybeSingle(),
     sb.from("profiles").select("*").order("display_name"),
     sb.from("settings").select("*").eq("id", 1).maybeSingle(),
     sb.from("shift_types").select("*").order("sort")
-  ]);
+  ]), 15000, "Supabase didn't answer when loading your staff list.");
   if (!prof) {
     screenEl().innerHTML = '<div class="center"><h2 class="title">Not set up yet</h2>' +
       '<p class="mut">Your account exists but has no staff profile. Ask the owner to add you.</p>' +
