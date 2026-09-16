@@ -1,9 +1,19 @@
-/* =====================================================================
-   La Habana Staff — app
-   Talks to Supabase. Every rule that matters (who sees what, where you
-   can clock in from, what time it is) is enforced by the database.
-   ===================================================================== */
+*/
 "use strict";
+ 
+/* Accepts what people actually paste: a trailing slash, the dashboard link,
+   or the project URL with something stuck on the end. */
+function cleanProjectUrl(raw) {
+  var u = String(raw || "").trim().replace(/\s+/g, "").replace(/\/+$/, "");
+  var m = u.match(/dashboard\/project\/([a-z0-9]{10,})/i);          // dashboard link
+  if (m) return "https://" + m[1] + ".supabase.co";
+  m = u.match(/([a-z0-9]{10,})\.supabase\.(co|in|net)/i);           // any project address
+  if (m) return "https://" + m[0].toLowerCase();
+  if (/^[a-z0-9]{15,}$/i.test(u)) return "https://" + u + ".supabase.co"; // bare project ref
+  return u;
+}
+window.LH.SUPABASE_URL = cleanProjectUrl(window.LH.SUPABASE_URL);
+window.LH.SUPABASE_ANON_KEY = String(window.LH.SUPABASE_ANON_KEY || "").trim();
  
 const sb = supabase.createClient(window.LH.SUPABASE_URL, window.LH.SUPABASE_ANON_KEY, {
   auth: { persistSession: true, autoRefreshToken: true }
@@ -173,6 +183,16 @@ function signInProblem(error) {
       '<p class="sm mut" style="margin:0">• Check for a typo or a stray space, and that the phone hasn\'t capitalised the first letter.</p>' +
       '<p class="sm mut" style="margin:0">• If your browser filled the password in for you, clear it and type it by hand.</p>' +
       '<p class="sm mut" style="margin:0">• Still stuck? In Supabase, <b>Authentication → Users</b>, set a new password on the account.</p>' +
+      '<button class="btn sec" data-act="closesheet">Got it</button>');
+  }
+  if (low.indexOf("invalid path") > -1 || low.indexOf("not found") > -1 || low.indexOf("failed to fetch") > -1) {
+    return sheet('<div style="font-weight:600;font-size:18px">The address in config.js is wrong</div>' +
+      '<p class="sm mut" style="margin:0">The app is reaching Supabase but knocking on the wrong door. It is currently using:</p>' +
+      '<p class="sm mono" style="margin:0;overflow-wrap:anywhere">' + esc(window.LH.SUPABASE_URL) + '</p>' +
+      '<p class="sm" style="margin:0">It has to be the <b>Project URL</b> from Supabase → <b>Project Settings → API</b>, which looks like:</p>' +
+      '<p class="sm mono" style="margin:0">https://abcdefghijklmnop.supabase.co</p>' +
+      '<p class="sm mut" style="margin:0">Not the dashboard link you browse with, and with nothing after <b>.co</b> — no slash, no /rest/v1.</p>' +
+      '<p class="sm mut" style="margin:0">Fix the SUPABASE_URL line in <b>config.js</b> on GitHub, commit, then reload here.</p>' +
       '<button class="btn sec" data-act="closesheet">Got it</button>');
   }
   if (low.indexOf("rate") > -1 || low.indexOf("too many") > -1) {
