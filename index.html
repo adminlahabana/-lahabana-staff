@@ -102,9 +102,93 @@ label.lbl{font-size:12px;color:var(--muted);display:block;margin-bottom:-4px}
   <nav id="tabbar" hidden></nav>
 </div>
 <div id="layer"></div>
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jsQR/1.4.0/jsQR.min.js"></script>
-<script src="config.js"></script>
-<script src="app.js"></script>
+<script>
+/* ---- loader: fetches the two libraries, then the app, and says what failed ---- */
+(function () {
+  var BUILD = "2";
+  var notes = [];
+  function note(t) { notes.push(t); }
+
+  window.addEventListener("error", function (e) {
+    if (e.target && e.target.tagName === "SCRIPT") note("Could not load " + e.target.src);
+    else if (e.message) note(e.message);
+  }, true);
+  window.addEventListener("unhandledrejection", function (e) {
+    note("" + ((e.reason && e.reason.message) || e.reason));
+  });
+
+  function load(src) {
+    return new Promise(function (ok, bad) {
+      var s = document.createElement("script");
+      s.src = src; s.async = false;
+      s.onload = ok;
+      s.onerror = function () { bad(new Error(src)); };
+      document.head.appendChild(s);
+    });
+  }
+  function tryList(list, test) {
+    return list.reduce(function (p, src) {
+      return p.then(function (done) {
+        if (done) return true;
+        return load(src).then(function () { return !!test(); }).catch(function () {
+          note("Blocked or missing: " + src);
+          return false;
+        });
+      });
+    }, Promise.resolve(false));
+  }
+
+  function problem(title, lines) {
+    var el = document.getElementById("screen");
+    if (!el) return;
+    document.getElementById("tabbar").hidden = true;
+    el.innerHTML =
+      '<div class="center" style="text-align:left">' +
+      '<h2 class="title">' + title + '</h2>' +
+      '<div class="card stack">' + lines.map(function (l) { return '<p class="sm" style="margin:0">' + l + '</p>'; }).join("") + '</div>' +
+      (notes.length ? '<div class="card stack"><p class="xs mut" style="margin:0">Technical detail, in case you send it on:</p>' +
+        notes.slice(0, 6).map(function (n) { return '<p class="xs mono" style="margin:0;overflow-wrap:anywhere">' + String(n).replace(/</g, "&lt;") + '</p>'; }).join("") + '</div>' : "") +
+      '<p class="xs mut">La Habana Staff · build ' + BUILD + '</p></div>';
+  }
+
+  var SUPA = ["https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js",
+              "https://unpkg.com/@supabase/supabase-js@2/dist/umd/supabase.js"];
+  var QR = ["https://cdnjs.cloudflare.com/ajax/libs/jsQR/1.4.0/jsQR.min.js",
+            "https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"];
+
+  tryList(SUPA, function () { return window.supabase && window.supabase.createClient; })
+    .then(function (ok) {
+      if (!ok) throw { stop: "library" };
+      return tryList(QR, function () { return window.jsQR; });
+    })
+    .then(function () {
+      return load("config.js").catch(function () { throw { stop: "config" }; });
+    })
+    .then(function () {
+      if (!window.LH || !window.LH.SUPABASE_URL) throw { stop: "config" };
+      return load("app.js").catch(function () { throw { stop: "app" }; });
+    })
+    .catch(function (e) {
+      if (e && e.stop === "library") problem("Can't reach the internet", [
+        "The app needs to download one small library the first time it opens, and that download was blocked.",
+        "Try again on mobile data instead of wifi, or switch off any ad-blocker or VPN on this phone, then reload."]);
+      else if (e && e.stop === "config") problem("config.js is missing", [
+        "The file <b>config.js</b> isn't in your repository, or it's named something else.",
+        "In GitHub, open the repository's file list. You should see <b>index.html, app.js, config.js, sw.js</b> and <b>manifest.webmanifest</b> sitting next to each other.",
+        "Watch out for names like config.js.txt — the name has to be exactly config.js."]);
+      else if (e && e.stop === "app") problem("app.js is missing", [
+        "The file <b>app.js</b> isn't in your repository, or it's named something else.",
+        "Add it with <b>Add file → Create new file</b>, name it exactly <b>app.js</b>, paste the whole file, and commit."]);
+      else problem("Something stopped the app", ["Reload the page. If it keeps happening, send me the technical detail below."]);
+    });
+
+  setTimeout(function () {
+    var s = document.querySelector("#screen .spin");
+    if (s && !window.LH) problem("Still loading", [
+      "The app's files are taking longer than they should, or one of them is missing.",
+      "Pull down to reload. If it stays like this, check that <b>app.js</b> and <b>config.js</b> are both in your repository."]);
+  }, 15000);
+})();
+</script>
 </body>
 </html>
