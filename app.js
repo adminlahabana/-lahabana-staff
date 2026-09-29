@@ -82,7 +82,8 @@ const S = {
   day: todayISO(), week: mondayOf(todayISO()), chat: null,
   unread: 0, cache: {}, busy: false, pendingSite: null,
   hr: null, hrReady: true, alerts: [],
-  threadUnread: {}, reads: {}, readsReady: true, lastReadWrite: 0
+  threadUnread: {}, reads: {}, readsReady: true, lastReadWrite: 0,
+  payRun: null, payRunRow: null, paySlips: [], slipOpen: null, mySlips: []
 };
 const person = id => S.people.find(p => p.id === id) || { display_name: "Someone", full_name: "Someone" };
 const isMgr = () => S.me && (S.me.role === "manager" || S.me.role === "owner");
@@ -356,7 +357,7 @@ function paintTabs() {
   $("tabbar").style.gridTemplateColumns = "repeat(" + tabs.length + ",1fr)";
   $("tabbar").innerHTML = tabs.map(t => {
     const n = t[0] === "chat" ? S.unread : 0;
-    return `<button data-act="tab" data-v="${t[0]}" aria-pressed="${S.tab === t[0]}">
+    return `<button data-act="tab" data-v="${t[0]}" aria-pressed="${S.tab === t[0] || (t[0] === "manage" && S.tab === "payroll")}">
       <span class="ic">${t[2]}</span>${t[1]}${n ? `<span class="dot">${n}</span>` : ""}</button>`;
   }).join("");
 }
@@ -370,6 +371,7 @@ async function render() {
     else if (S.tab === "board") await viewBoard();
     else if (S.tab === "chat") await viewChat();
     else if (S.tab === "manage") await viewManage();
+    else if (S.tab === "payroll") await viewPayroll();
     refreshAlerts().then(paintBell, () => {});
   } catch (err) {
     screenEl().innerHTML = head("Something went wrong") +
@@ -404,6 +406,18 @@ async function refreshAlerts(force) {
       s: fmtDate(S.hr[d[0]]), act: "profile"
     });
   });
+ 
+  /* a payslip published in the last two weeks that you haven't opened on this phone */
+  try {
+    const { data: slips, error } = await sb.from("payslips").select("id, pay_runs(label,status,published_at)").eq("user_id", S.me.id);
+    if (!error) (slips || []).forEach(p => {
+      const r = p.pay_runs;
+      if (!r || r.status !== "published" || !r.published_at) return;
+      if (Date.now() - new Date(r.published_at) > 14 * 86400e3) return;
+      let seen = false; try { seen = !!localStorage.getItem("lh-slip-" + p.id); } catch (e) { /* private mode */ }
+      if (!seen) items.push({ ic: "Rf", t: "Your payslip for " + r.label + " is ready", s: "Tap to open it", act: "payslip", v: p.id });
+    });
+  } catch (e) { /* payroll not switched on yet */ }
  
   if (isMgr()) {
     const [inc, reqs, jobs, hrAll] = await Promise.all([
@@ -1325,6 +1339,7 @@ async function profileSheet() {
     ${S.hrReady ? "" : `<p class="xs mut" style="margin:6px 0 0">Employment details aren't switched on yet${isOwner() ? " — run <b>update-1.sql</b> in Supabase → SQL Editor." : " — ask the owner."}</p>`}
     ${S.hrReady && isMgr() ? '<p class="xs mut" style="margin:6px 0 0">Managers fill these in under Manage → Staff.</p>'
       : S.hrReady ? '<p class="xs mut" style="margin:6px 0 0">Your manager keeps these up to date. Tell them if anything here is wrong.</p>' : ""}
+    <button class="btn" data-act="mypayslips">My payslips</button>
     <button class="btn sec" data-act="editme">Edit my name and phone</button>
     <button class="btn sec" data-act="signout">Sign out</button>`);
 }
@@ -1360,6 +1375,11 @@ async function viewManage() {
       <button class="tile" data-act="tab" data-v="shifts" data-sub="timesheet"><span class="lbl">Timesheet</span><span class="sm mut">Hours and corrections</span></button>
     </div>
     ${isOwner() ? `
+      <h3 class="sec">Pay</h3>
+      <div class="grid2">
+        <button class="tile gold" data-act="payroll"><span class="lbl">Payroll</span><span class="sm mut">Months and payslips</span></button>
+        <button class="tile" data-act="paysetup"><span class="lbl">Pay setup</span><span class="sm mut">Salaries, rates, allowances</span></button>
+      </div>
       <h3 class="sec">Venue</h3>
       <div class="card stack">
         <label class="lbl" for="vn">Venue name</label><input id="vn" value="${esc(s.venue_name || "")}">
@@ -1486,6 +1506,481 @@ function csvExport(){
   });
 }
  
+/* ---------- payroll (owner) and payslips (everyone) -------------------- */
+/* Pay rates, pay runs and payslips live in their own tables (update-3-payroll.sql).
+   The database does the sums and decides who sees what: only the owner sees
+   anyone's pay, and staff see their own payslip only once the month is published. */
+const money = n => Number(n || 0).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const cur = run => (run && run.currency) || "MVR";
+const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+const ADD_KINDS = ["Bonus", "Tips", "Arrears", "Other addition"];
+const DED_KINDS = ["Salary advance", "No-pay leave", "Loan repayment", "Breakage", "Other deduction"];
+const payMissing = err => {
+  const m = ((err && (err.message || err.details)) || "").toLowerCase();
+  return (err && (err.code === "42P01" || err.code === "PGRST205" || err.code === "PGRST202")) ||
+    m.indexOf("does not exist") > -1 || m.indexOf("schema cache") > -1;
+};
+const payOff = () => `<div class="card stack"><span class="chip warn">Not switched on yet</span>
+  <div class="big">Payroll needs one database update</div>
+  <p class="sm mut" style="margin:0">Open Supabase → SQL Editor, paste <b>update-3-payroll.sql</b> and press Run. Run <b>update-2.sql</b> first if you haven't yet.</p></div>`;
+ 
+/* The lines of a payslip, in the order they are printed. Used on screen and in the PDF. */
+function slipLines(p) {
+  const earn = [];
+  if (p.pay_type === "hourly") earn.push(["Hours worked", money(p.hours) + " h x " + money(p.hourly_rate), p.basic]);
+  else earn.push(["Basic salary", p.days_employed < p.days_in_period ? p.days_employed + " of " + p.days_in_period + " days" : "", p.basic]);
+  if (Number(p.ot_pay)) earn.push([p.pay_type === "hourly" ? "Overtime premium" : "Overtime",
+    money(p.ot_hours) + " h x " + money(p.ot_pay / p.ot_hours), p.ot_pay]);
+  if (Number(p.holiday_pay)) earn.push(["Public holiday premium", money(p.holiday_hours) + " h x " + money(p.holiday_pay / p.holiday_hours), p.holiday_pay]);
+  (p.allowances || []).forEach(a => earn.push([a.name + " allowance", "", a.amount]));
+  if (Number(p.sc_share)) earn.push(["Service charge share", "", p.sc_share]);
+  (p.additions || []).forEach(a => earn.push([a.name, "", a.amount]));
+  const ded = (p.deductions || []).map(d => [d.name, "", d.amount]);
+  return { earn, ded };
+}
+const maskAcct = a => a ? (String(a).length > 4 ? "****" + String(a).slice(-4) : String(a)) : "";
+ 
+/* ---- the Payroll screen (Manage → Payroll) ---- */
+async function viewPayroll() {
+  if (!isOwner()) { S.tab = isMgr() ? "manage" : "home"; paintTabs(); return isMgr() ? viewManage() : viewHome(); }
+  const back = `<button class="chip" data-act="tab" data-v="manage" style="margin-bottom:12px">‹ Manage</button>`;
+  if (S.payRun) return payRunView(back);
+  const [runs, slips, profs] = await Promise.all([
+    sb.from("pay_runs").select("*").order("period_start", { ascending: false }),
+    sb.from("payslips").select("run_id,net"),
+    sb.from("pay_profiles").select("user_id,pay_type,basic_salary,hourly_rate,active")
+  ]);
+  if (runs.error) {
+    if (payMissing(runs.error)) { screenEl().innerHTML = head("Payroll") + back + payOff(); return; }
+    throw runs.error;
+  }
+  const set = (profs.data || []).filter(p => p.active && (p.pay_type === "monthly" ? Number(p.basic_salary) : Number(p.hourly_rate)));
+  const notSet = S.people.filter(p => !set.some(x => x.user_id === p.id));
+  const byRun = {};
+  (slips.data || []).forEach(s => { const r = byRun[s.run_id] || (byRun[s.run_id] = { n: 0, net: 0 }); r.n++; r.net += Number(s.net); });
+  screenEl().innerHTML = head("Payroll") + back + `
+    <button class="btn" data-act="newrun">Start a new month</button>
+    <div class="grid2" style="margin-top:10px">
+      <button class="tile" data-act="paysetup"><span class="lbl">Pay setup</span><span class="sm mut">${set.length} set up${notSet.length ? " · " + notSet.length + " not set" : ""}</span></button>
+      <button class="tile" data-act="paysettings"><span class="lbl">Rules</span><span class="sm mut">Overtime, holidays, service charge</span></button>
+    </div>
+    ${notSet.length ? `<div class="warnbox" style="margin-top:12px"><b>No pay set for ${notSet.length}</b>
+      <span>${esc(notSet.map(p => p.display_name).join(", "))} — left off payroll until a salary or hourly rate is set.</span></div>` : ""}
+    <h3 class="sec">Months</h3>
+    <div class="stack">${(runs.data || []).map(r => `<button class="listitem" data-act="payrun" data-v="${r.id}">
+        <span class="chip ${r.status === "published" ? "ok" : "warn"}">${r.status === "published" ? "Published" : "Draft"}</span>
+        <span class="sm"><b>${esc(r.label)}</b><br><span class="xs mut">${(byRun[r.id] || { n: 0 }).n} payslips${r.pay_date ? " · paid " + fmtDate(r.pay_date) : ""}</span></span>
+        <span class="sm mono">${money((byRun[r.id] || { net: 0 }).net)}</span></button>`).join("")
+      || '<p class="sm mut">No months yet. Set everyone\'s pay first, then start a month.</p>'}</div>`;
+}
+ 
+async function payRunView(back) {
+  const [{ data: run, error }, { data: slips }] = await Promise.all([
+    sb.from("pay_runs").select("*").eq("id", S.payRun).maybeSingle(),
+    sb.from("payslips").select("*").eq("run_id", S.payRun).order("full_name")
+  ]);
+  if (error) throw error;
+  if (!run) { S.payRun = null; return viewPayroll(); }
+  const from = new Date(run.period_start + "T00:00:00+05:00").toISOString();
+  const to = new Date(addDays(run.period_end, 1) + "T00:00:00+05:00").toISOString();
+  const { data: sh } = await sb.from("shifts").select("id,ended_at,auto_closed").gte("started_at", from).lt("started_at", to);
+  const open = (sh || []).filter(s => !s.ended_at).length, auto = (sh || []).filter(s => s.auto_closed).length;
+  const list = slips || [];
+  const tot = k => list.reduce((n, s) => n + Number(s[k] || 0), 0);
+  const draft = run.status === "draft";
+  const scPaid = tot("sc_share");
+  const warn = [];
+  if (open) warn.push(open + " shift" + (open > 1 ? "s are" : " is") + " still open in this month — their hours aren't counted until someone clocks them out.");
+  if (auto) warn.push(auto + " shift" + (auto > 1 ? "s were" : " was") + " auto-closed after 14 hours. Check them on the timesheet.");
+  if (Number(run.sc_pool) && Math.abs(scPaid - Number(run.sc_pool)) > 0.001) warn.push("Service charge pool is " + money(run.sc_pool) + " but " + money(scPaid) + " is on the payslips. Press Recalculate.");
+  if (!run.calculated_at) warn.push("Not calculated yet. Press Recalculate.");
+  list.filter(s => Number(s.net) < 0).forEach(s => warn.push(s.full_name + "'s net pay is below zero."));
+  screenEl().innerHTML = head(run.label) + `<button class="chip" data-act="payback" style="margin-bottom:12px">‹ All months</button>
+    <div class="card stack">
+      <div class="between"><span class="chip ${draft ? "warn" : "ok"}">${draft ? "Draft — staff can't see it" : "Published"}</span>
+        <span class="xs mut mono">${fmtDate(run.period_start)} – ${fmtDate(run.period_end)}</span></div>
+      ${kv("Payslips", String(list.length))}
+      ${kv("Gross pay", cur(run) + " " + money(tot("gross")))}
+      ${kv("Deductions", cur(run) + " " + money(tot("total_deductions")))}
+      ${kv("Net to pay", cur(run) + " " + money(tot("net")))}
+      ${kv("Service charge shared", cur(run) + " " + money(scPaid) + (run.sc_method ? " · " + run.sc_method : ""))}
+      ${run.pay_date ? kv("Pay date", fmtDate(run.pay_date)) : ""}
+      ${run.calculated_at ? `<span class="xs mut">Last calculated ${fmtDayTime(run.calculated_at)}</span>` : ""}
+    </div>
+    ${warn.length ? `<div class="warnbox" style="margin-top:12px">${warn.map(w => `<span>• ${esc(w)}</span>`).join("")}</div>` : ""}
+    ${draft ? `<h3 class="sec">This month</h3><div class="card stack">
+      <label class="lbl" for="rsc">Service charge pool to share (${cur(run)})</label>
+      <input id="rsc" type="number" inputmode="decimal" min="0" step="0.01" value="${Number(run.sc_pool) || ""}" placeholder="0.00">
+      <label class="lbl" for="rpd">Pay date</label><input id="rpd" type="date" value="${run.pay_date || ""}">
+      <button class="btn" data-act="recalc">Save and recalculate</button>
+      <p class="xs mut" style="margin:0">Recalculating reads the timesheets again. Anything you typed on a payslip — bonuses, advances, notes — stays.</p></div>` : ""}
+    <h3 class="sec">Payslips</h3>
+    <div class="stack">${list.map(s => `<button class="listitem${Number(s.net) < 0 ? " flagged" : ""}" data-act="slip" data-v="${s.id}">
+        <span class="avatar sm">${esc(initials(s.full_name))}</span>
+        <span class="sm">${esc(s.full_name)}<br><span class="xs mut">${esc(s.designation || s.pay_type)} · ${s.pay_type === "hourly" ? money(s.hours) + " h" : "monthly"}${Number(s.ot_hours) ? " · " + money(s.ot_hours) + " h OT" : ""}</span></span>
+        <span class="sm mono">${money(s.net)}</span></button>`).join("")
+      || '<p class="sm mut">No payslips yet. Press Save and recalculate.</p>'}</div>
+    <div class="stack" style="margin-top:16px">
+      ${list.length ? `<button class="btn sec" data-act="slipsall">Download all payslips (PDF)</button>
+      <button class="btn sec" data-act="paycsv">Payment list (CSV, with bank details)</button>` : ""}
+      ${draft ? `<button class="btn" data-act="publishrun"${list.length && run.calculated_at ? "" : " disabled"}>Publish — staff can see their payslips</button>
+        <button class="btn sec" data-act="delrun">Delete this draft</button>`
+      : `<button class="btn sec" data-act="reopenrun">Reopen as draft to correct it</button>`}
+    </div>`;
+  S.payRunRow = run; S.paySlips = list;
+}
+ 
+function newRunSheet() {
+  const now = new Date(todayISO() + "T12:00:00Z");
+  const val = now.getUTCFullYear() + "-" + String(now.getUTCMonth() + 1).padStart(2, "0");
+  sheet(`<div style="font-weight:600;font-size:18px">Start a new month</div>
+    <label class="lbl" for="rm">Month</label><input id="rm" type="month" value="${val}">
+    <label class="lbl" for="rsc2">Service charge pool (${"MVR"}) — you can change it later</label>
+    <input id="rsc2" type="number" inputmode="decimal" min="0" step="0.01" placeholder="0.00">
+    <label class="lbl" for="rpd2">Pay date</label><input id="rpd2" type="date">
+    <button class="btn" data-act="saverun">Create and calculate</button>
+    <p class="xs mut" style="margin:0">It starts as a draft. Nobody sees it until you publish.</p>`);
+}
+async function saveRun() {
+  const m = $("rm").value;
+  if (!/^\d{4}-\d{2}$/.test(m)) return toast("Pick a month.", true);
+  const [y, mo] = m.split("-").map(Number);
+  const start = m + "-01";
+  const end = new Date(Date.UTC(y, mo, 0)).toISOString().slice(0, 10);
+  busy(true);
+  const { data, error } = await sb.from("pay_runs").insert({
+    label: MONTHS[mo - 1] + " " + y, period_start: start, period_end: end,
+    sc_pool: parseFloat($("rsc2").value) || 0, pay_date: $("rpd2").value || null, created_by: S.me.id
+  }).select().single();
+  if (error) { busy(false); return toast(error.code === "23505" ? "That month already exists — open it from the list." : error.message, true); }
+  const calc = await sb.rpc("payroll_calculate", { p_run: data.id });
+  busy(false);
+  closeSheet();
+  if (calc.error) toast(calc.error.message, true); else toast(calc.data.people + " payslips made.");
+  S.payRun = data.id; return render();
+}
+async function recalcRun() {
+  const pool = parseFloat($("rsc").value) || 0;
+  if (pool < 0) return toast("The pool can't be negative.", true);
+  busy(true);
+  const up = await sb.from("pay_runs").update({ sc_pool: pool, pay_date: $("rpd").value || null }).eq("id", S.payRun);
+  if (up.error) { busy(false); return toast(up.error.message, true); }
+  const { data, error } = await sb.rpc("payroll_calculate", { p_run: S.payRun });
+  busy(false);
+  if (error) return toast(error.message, true);
+  toast(data.people + " payslips · net " + money(data.net));
+  return render();
+}
+ 
+/* ---- one payslip ---- */
+function slipHtml(p, run) {
+  const { earn, ded } = slipLines(p);
+  const line = (l, i, kind, edit) => `<div class="kv"><span class="sm">${esc(l[0])}${l[1] ? `<br><span class="xs mut">${esc(l[1])}</span>` : ""}</span>
+      <span class="sm mono">${money(l[2])}${edit ? ` <button class="chip bad" data-act="slipdel" data-v="${kind}|${i}" aria-label="Remove">✕</button>` : ""}</span></div>`;
+  const edit = isOwner() && run.status === "draft";
+  const nAdd = (p.additions || []).length;
+  const base = earn.length - nAdd;
+  return `<div class="card stack">
+      <div class="between"><span class="sm"><b>${esc(p.full_name)}</b><br><span class="xs mut">${esc([p.employee_no, p.designation].filter(Boolean).join(" · ") || "")}</span></span>
+        <span class="xs mut mono">${esc(run.label)}</span></div>
+      <div><h3 class="sec" style="margin:6px 0 4px">Earnings</h3>
+        ${earn.map((l, i) => line(l, i - base, "add", edit && i >= base)).join("")}
+        <div class="kv"><span class="sm"><b>Gross pay</b></span><span class="sm mono"><b>${money(p.gross)}</b></span></div></div>
+      ${ded.length ? `<div><h3 class="sec" style="margin:6px 0 4px">Deductions</h3>
+        ${ded.map((l, i) => line(l, i, "ded", edit)).join("")}
+        <div class="kv"><span class="sm"><b>Total deductions</b></span><span class="sm mono"><b>${money(p.total_deductions)}</b></span></div></div>` : ""}
+      <div class="between" style="background:var(--gold-soft);border:1px solid #4A3B1C;border-radius:12px;padding:12px 14px">
+        <span class="sm" style="color:var(--gold-ink)"><b>Net pay</b></span>
+        <span class="big mono" style="color:var(--gold-ink)">${cur(run)} ${money(p.net)}</span></div>
+      <span class="xs mut">${money(p.hours)} hours clocked${Number(p.ot_hours) ? " · " + money(p.ot_hours) + " h overtime" : ""}${p.pay_method ? " · " + esc(p.pay_method) : ""}${p.account_no ? " " + esc(maskAcct(p.account_no)) : ""}</span>
+      ${p.note ? `<div class="note">${esc(p.note)}</div>` : ""}
+    </div>`;
+}
+async function slipSheet(id) {
+  const { data: p, error } = await sb.from("payslips").select("*").eq("id", id).maybeSingle();
+  if (error || !p) return toast(error ? error.message : "That payslip is gone.", true);
+  const run = S.payRunRow;
+  const edit = run.status === "draft";
+  S.slipOpen = p;
+  sheet(`${slipHtml(p, run)}
+    ${edit ? `<div class="card stack"><div class="sm"><b>Add a line</b></div>
+      <select id="sk">${ADD_KINDS.map(k => `<option value="add|${k}">+ ${k}</option>`).join("")}${DED_KINDS.map(k => `<option value="ded|${k}">− ${k}</option>`).join("")}</select>
+      <input id="sn" placeholder="Details, optional (e.g. 2 days, 12–13 Sep)">
+      <input id="sa" type="number" inputmode="decimal" min="0" step="0.01" placeholder="Amount (${cur(run)})">
+      <button class="btn sm" data-act="slipadd">Add to payslip</button>
+      <label class="lbl" for="snote">Note printed on the payslip</label><textarea id="snote" rows="2">${esc(p.note || "")}</textarea>
+      <button class="btn sec sm" data-act="slipnote">Save note</button></div>` : ""}
+    <button class="btn" data-act="slippdf" data-v="${p.id}">Download PDF</button>
+    <button class="btn sec" data-act="closesheet">Close</button>`);
+}
+async function slipChange(fn) {
+  const p = S.slipOpen; if (!p) return;
+  const patch = fn({ additions: (p.additions || []).slice(), deductions: (p.deductions || []).slice(), note: p.note });
+  if (!patch) return;
+  busy(true);
+  const { error } = await sb.from("payslips").update(patch).eq("id", p.id);
+  busy(false);
+  if (error) return toast(error.message, true);
+  await slipSheet(p.id);
+  payRunView().catch(() => {});   // keep the list behind in step
+}
+ 
+/* ---- pay setup ---- */
+async function paySetupSheet() {
+  const [{ data: profs, error }, { data: all }] = await Promise.all([
+    sb.from("pay_profiles").select("*"), sb.from("profiles").select("*").order("display_name")
+  ]);
+  if (error) return toast(payMissing(error) ? "Run update-3-payroll.sql in Supabase first." : error.message, true);
+  sheet(`<div style="font-weight:600;font-size:18px">Pay setup</div>
+    <p class="xs mut" style="margin:0">Each person's pay. Changes apply to the next calculation, never to a published month.</p>
+    <div class="stack">${(all || []).filter(p => p.active || (profs || []).some(x => x.user_id === p.id && x.active)).map(p => {
+      const x = (profs || []).find(r => r.user_id === p.id);
+      const amt = x && (x.pay_type === "monthly" ? Number(x.basic_salary) : Number(x.hourly_rate));
+      const txt = !x || !amt ? "Not set" : x.pay_type === "monthly" ? "Monthly " + money(x.basic_salary) : "Hourly " + money(x.hourly_rate);
+      return `<button class="listitem" data-act="payedit" data-v="${p.id}">
+        <span class="avatar sm">${esc(initials(p.display_name))}</span>
+        <span class="sm">${esc(p.display_name)}<br><span class="xs mut">${esc(p.position || "")}${x && !x.active ? " · off payroll" : ""}</span></span>
+        <span class="chip ${amt && x.active ? "gold" : "warn"}">${esc(txt)}</span></button>`;
+    }).join("")}</div>
+    <button class="btn sec" data-act="closesheet">Close</button>`);
+}
+async function payEditSheet(uid) {
+  const { data } = await sb.from("pay_profiles").select("*").eq("user_id", uid).maybeSingle();
+  const x = data || { pay_type: "monthly", basic_salary: 0, hourly_rate: 0, allowances: [], ot_eligible: true, sc_eligible: true, sc_points: 1, pay_method: "Bank transfer", active: true };
+  const p = person(uid);
+  const chk = (id, on, label) => `<label class="chip"><input type="checkbox" id="${id}"${on ? " checked" : ""} style="width:auto;margin-right:6px"> ${label}</label>`;
+  sheet(`<div style="font-weight:600;font-size:18px">${esc(p.display_name)}</div>
+    <div class="sm mut">${esc(p.full_name || "")}</div>
+    <label class="lbl" for="xt">Paid</label>
+    <select id="xt"><option value="monthly"${x.pay_type === "monthly" ? " selected" : ""}>Monthly salary</option>
+      <option value="hourly"${x.pay_type === "hourly" ? " selected" : ""}>By the hour, from the timesheet</option></select>
+    <label class="lbl" for="xb">Basic salary per month (MVR)</label><input id="xb" type="number" inputmode="decimal" min="0" step="0.01" value="${Number(x.basic_salary) || ""}">
+    <label class="lbl" for="xr">Hourly rate (MVR) — hourly staff only</label><input id="xr" type="number" inputmode="decimal" min="0" step="0.01" value="${Number(x.hourly_rate) || ""}">
+    <label class="lbl" for="xa">Monthly allowances, one per line: name = amount</label>
+    <textarea id="xa" rows="3" placeholder="Food = 1000&#10;Transport = 500">${esc((x.allowances || []).map(a => a.name + " = " + a.amount).join("\n"))}</textarea>
+    <div class="row">${chk("xo", x.ot_eligible, "Gets overtime")}${chk("xs", x.sc_eligible, "Shares service charge")}${chk("xact", x.active, "On payroll")}</div>
+    <label class="lbl" for="xp">Service charge points (only used if the rule is "points")</label><input id="xp" type="number" min="0" step="0.5" value="${x.sc_points}">
+    <label class="lbl" for="xm">Paid by</label>
+    <select id="xm">${["Bank transfer", "Cash"].map(m => `<option${x.pay_method === m ? " selected" : ""}>${m}</option>`).join("")}</select>
+    <label class="lbl" for="xbn">Bank</label><input id="xbn" value="${esc(x.bank_name || "")}" placeholder="BML, MIB …">
+    <label class="lbl" for="xan">Account name</label><input id="xan" value="${esc(x.account_name || "")}">
+    <label class="lbl" for="xno">Account number</label><input id="xno" inputmode="numeric" value="${esc(x.account_no || "")}">
+    <p class="xs mut" style="margin:0">Only you can see these. The payslip shows the last four digits.</p>
+    <button class="btn" data-act="paysave" data-v="${uid}">Save</button>
+    <button class="btn sec" data-act="paysetup">Back</button>`);
+}
+async function paySave(uid) {
+  const allowances = [];
+  const bad = [];
+  $("xa").value.split("\n").map(l => l.trim()).filter(Boolean).forEach(l => {
+    const m = l.match(/^(.+?)\s*[=:\-]\s*([\d,]+(?:\.\d+)?)$/);
+    if (!m) return bad.push(l);
+    allowances.push({ name: m[1].trim(), amount: parseFloat(m[2].replace(/,/g, "")) });
+  });
+  if (bad.length) return toast('Allowance lines need "name = amount": ' + bad[0], true);
+  const type = $("xt").value;
+  const basic = parseFloat($("xb").value) || 0, rate = parseFloat($("xr").value) || 0;
+  if (type === "monthly" && !basic) return toast("Put in the monthly basic salary.", true);
+  if (type === "hourly" && !rate) return toast("Put in the hourly rate.", true);
+  busy(true);
+  const { error } = await sb.from("pay_profiles").upsert({
+    user_id: uid, pay_type: type, basic_salary: basic, hourly_rate: rate, allowances,
+    ot_eligible: $("xo").checked, sc_eligible: $("xs").checked, active: $("xact").checked,
+    sc_points: parseFloat($("xp").value) || 0, pay_method: $("xm").value,
+    bank_name: $("xbn").value.trim() || null, account_name: $("xan").value.trim() || null,
+    account_no: $("xno").value.replace(/\s+/g, "") || null
+  }, { onConflict: "user_id" });
+  busy(false);
+  if (error) return toast(error.message, true);
+  toast("Pay saved for " + person(uid).display_name + ".");
+  if (S.tab === "payroll" && !S.payRun) viewPayroll().catch(() => {});
+  return paySetupSheet();
+}
+ 
+/* ---- payroll rules ---- */
+async function paySettingsSheet() {
+  const { data: s, error } = await sb.from("pay_settings").select("*").eq("id", 1).maybeSingle();
+  if (error) return toast(payMissing(error) ? "Run update-3-payroll.sql in Supabase first." : error.message, true);
+  sheet(`<div style="font-weight:600;font-size:18px">Payroll rules</div>
+    <label class="lbl" for="ze">Employer name on payslips</label><input id="ze" value="${esc(s.employer_name)}">
+    <label class="lbl" for="zad">Address on payslips</label><input id="zad" value="${esc(s.employer_address)}">
+    <h3 class="sec" style="margin:10px 0 0">Overtime</h3>
+    <label class="lbl" for="zw">Normal hours in a week — overtime is anything above</label><input id="zw" type="number" step="0.5" value="${s.week_hours}">
+    <label class="lbl" for="zot">Overtime rate (× normal hourly pay)</label><input id="zot" type="number" step="0.05" value="${s.ot_rate}">
+    <label class="lbl" for="zmh">Hours in a month, to turn a salary into an hourly rate</label><input id="zmh" type="number" step="1" value="${s.month_hours}">
+    <p class="xs mut" style="margin:0">208 = 48 hours × 52 weeks ÷ 12. A 12,000 salary is then 57.69 an hour.</p>
+    <h3 class="sec" style="margin:10px 0 0">Public holidays</h3>
+    <label class="lbl" for="zhr">Holiday rate (× normal hourly pay)</label><input id="zhr" type="number" step="0.05" value="${s.holiday_rate}">
+    <label class="lbl" for="zh">Holiday dates, one per line (YYYY-MM-DD)</label>
+    <textarea id="zh" rows="4" placeholder="2026-11-03&#10;2026-11-11">${esc((s.holidays || []).join("\n"))}</textarea>
+    <label class="chip"><input type="checkbox" id="zfri"${s.fridays_are_holidays ? " checked" : ""} style="width:auto;margin-right:6px"> Pay Fridays at the holiday rate too</label>
+    <h3 class="sec" style="margin:10px 0 0">Service charge</h3>
+    <label class="lbl" for="zsc">How the pool is shared</label>
+    <select id="zsc">
+      <option value="equal"${s.sc_method === "equal" ? " selected" : ""}>Equally among everyone who shares it</option>
+      <option value="hours"${s.sc_method === "hours" ? " selected" : ""}>By hours worked that month</option>
+      <option value="points"${s.sc_method === "points" ? " selected" : ""}>By points set per person</option></select>
+    <button class="btn" data-act="paysetsave">Save rules</button>
+    <p class="xs mut" style="margin:0">Rules apply the next time a draft month is recalculated. Check the rates against the Employment Act and your contracts.</p>`);
+}
+async function paySettingsSave() {
+  const hol = $("zh").value.split(/[\s,]+/).map(x => x.trim()).filter(Boolean);
+  const badDate = hol.find(d => !/^\d{4}-\d{2}-\d{2}$/.test(d) || isNaN(new Date(d + "T12:00:00Z")));
+  if (badDate) return toast("Not a date: " + badDate + " — use YYYY-MM-DD.", true);
+  const num = id => parseFloat($(id).value);
+  if (!(num("zw") > 0) || !(num("zmh") > 0) || !(num("zot") >= 1) || !(num("zhr") >= 1)) return toast("Hours must be above 0 and rates 1 or more.", true);
+  busy(true);
+  const { error } = await sb.from("pay_settings").update({
+    employer_name: $("ze").value.trim() || "La Habana Lounge", employer_address: $("zad").value.trim(),
+    week_hours: num("zw"), ot_rate: num("zot"), month_hours: num("zmh"), holiday_rate: num("zhr"),
+    holidays: [...new Set(hol)].sort(), fridays_are_holidays: $("zfri").checked, sc_method: $("zsc").value,
+    updated_at: new Date().toISOString()
+  }).eq("id", 1);
+  busy(false);
+  if (error) return toast(error.message, true);
+  closeSheet(); toast("Rules saved. Recalculate any draft month to apply them.");
+}
+ 
+/* ---- my payslips (everyone) ---- */
+async function myPayslipsSheet() {
+  const { data, error } = await sb.from("payslips").select("*, pay_runs(*)").eq("user_id", S.me.id);
+  if (error) return toast(payMissing(error) ? "Payslips aren't switched on yet." : error.message, true);
+  const mine = (data || []).filter(p => p.pay_runs && p.pay_runs.status === "published")
+    .sort((a, b) => b.pay_runs.period_start.localeCompare(a.pay_runs.period_start));
+  sheet(`<div style="font-weight:600;font-size:18px">My payslips</div>
+    ${mine.length ? `<div class="stack">${mine.map(p => `<button class="listitem" data-act="myslip" data-v="${p.id}">
+        <span class="chip gold">${esc(p.pay_runs.label.split(" ")[0].slice(0, 3))}</span>
+        <span class="sm"><b>${esc(p.pay_runs.label)}</b><br><span class="xs mut">${p.pay_runs.pay_date ? "Paid " + fmtDate(p.pay_runs.pay_date) : "Published " + fmtDate((p.pay_runs.published_at || "").slice(0, 10))}</span></span>
+        <span class="sm mono">${money(p.net)}</span></button>`).join("")}</div>`
+      : '<p class="sm mut" style="margin:0">No payslips yet. They appear here when the owner publishes the month.</p>'}
+    <button class="btn sec" data-act="profile">Back</button>`);
+  S.mySlips = mine;
+}
+function mySlipSheet(id) {
+  const p = (S.mySlips || []).find(x => x.id === id);
+  if (!p) return;
+  try { localStorage.setItem("lh-slip-" + id, "1"); } catch (e) { /* private mode */ }
+  S.alerts = S.alerts.filter(a => !(a.act === "payslip" && a.v === id)); paintBell();
+  sheet(`${slipHtml(p, p.pay_runs)}
+    <button class="btn" data-act="myslippdf" data-v="${id}">Download PDF</button>
+    <p class="xs mut" style="margin:0">Something wrong? Message the manager before payday — a published payslip can be corrected and republished.</p>
+    <button class="btn sec" data-act="mypayslips">All my payslips</button>`);
+}
+ 
+/* ---- PDF payslips, drawn on the phone ---- */
+let pdfLib = null, logoData = null;
+function loadPdfLib() {
+  if (window.jspdf) return Promise.resolve(window.jspdf);
+  if (pdfLib) return pdfLib;
+  const srcs = ["https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js",
+    "https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"];
+  pdfLib = srcs.reduce((p, src) => p.catch(() => new Promise((ok, bad) => {
+    const s = document.createElement("script"); s.src = src;
+    s.onload = () => window.jspdf ? ok(window.jspdf) : bad(); s.onerror = bad;
+    document.head.appendChild(s);
+  })), Promise.reject()).catch(() => { pdfLib = null; throw new Error("Couldn't load the PDF maker. Check the internet and try again."); });
+  return pdfLib;
+}
+async function loadLogo() {
+  if (logoData !== null) return logoData;
+  try {
+    const blob = await (await fetch("icon-192.png")).blob();
+    logoData = await new Promise(ok => { const r = new FileReader(); r.onload = () => ok(r.result); r.onerror = () => ok(""); r.readAsDataURL(blob); });
+  } catch (e) { logoData = ""; }
+  return logoData;
+}
+/* One A4 page. Plain Helvetica, so every phone and printer gets the same thing. */
+function drawSlip(doc, p, run, logo) {
+  const W = 595.28, M = 44, R = W - M;
+  const gold = "#B8892F", ink = "#1A1712", mut = "#6F675A", line = "#DDD5C5";
+  const C = run.currency || "MVR";
+  doc.setFillColor("#121110"); doc.rect(0, 0, W, 104, "F");
+  if (logo) doc.addImage(logo, "PNG", M, 22, 60, 60);
+  const tx = logo ? M + 76 : M;
+  doc.setTextColor("#E3C377"); doc.setFont("helvetica", "bold"); doc.setFontSize(17);
+  doc.text((run.employer_name || "La Habana Lounge").toUpperCase(), tx, 50);
+  doc.setFont("helvetica", "normal"); doc.setFontSize(9); doc.setTextColor("#B9AE98");
+  doc.text(run.employer_address || "", tx, 66);
+  doc.setTextColor("#E3C377"); doc.setFont("helvetica", "bold"); doc.setFontSize(11);
+  doc.text("PAYSLIP", R, 46, { align: "right" });
+  doc.setFont("helvetica", "normal"); doc.setFontSize(10); doc.setTextColor("#F1EBDD");
+  doc.text(run.label || "", R, 62, { align: "right" });
+ 
+  let y = 138;
+  const pair = (x, label, val) => {
+    doc.setFont("helvetica", "normal"); doc.setFontSize(8); doc.setTextColor(mut); doc.text(label.toUpperCase(), x, y);
+    doc.setFontSize(10.5); doc.setTextColor(ink); doc.text(String(val || "-"), x, y + 14);
+  };
+  const c2 = M + 260;
+  pair(M, "Employee", p.full_name); pair(c2, "Pay period", fmtDate(run.period_start) + " to " + fmtDate(run.period_end)); y += 36;
+  pair(M, "Employee ID", p.employee_no); pair(c2, "Pay date", run.pay_date ? fmtDate(run.pay_date) : "-"); y += 36;
+  pair(M, "Designation", p.designation); pair(c2, "Paid by", [p.pay_method, p.bank_name, maskAcct(p.account_no)].filter(Boolean).join(" · ")); y += 36;
+  pair(M, "Pay basis", p.pay_type === "hourly" ? "Hourly, " + C + " " + money(p.hourly_rate) + " an hour" : "Monthly salary");
+  pair(c2, "Hours clocked", money(p.hours) + " h" + (Number(p.ot_hours) ? "  (overtime " + money(p.ot_hours) + " h)" : "")); y += 44;
+ 
+  const { earn, ded } = slipLines(p);
+  const table = (title, rows, totalLabel, total) => {
+    doc.setFillColor("#F4EFE4"); doc.rect(M, y - 13, R - M, 20, "F");
+    doc.setFont("helvetica", "bold"); doc.setFontSize(9); doc.setTextColor(ink);
+    doc.text(title.toUpperCase(), M + 8, y); doc.text(C, R - 8, y, { align: "right" });
+    y += 22;
+    doc.setFont("helvetica", "normal"); doc.setFontSize(10);
+    rows.forEach(r => {
+      doc.setTextColor(ink); doc.text(String(r[0]), M + 8, y);
+      if (r[1]) { doc.setTextColor(mut); doc.setFontSize(8.5); doc.text(String(r[1]), M + 250, y); doc.setFontSize(10); doc.setTextColor(ink); }
+      doc.text(money(r[2]), R - 8, y, { align: "right" });
+      doc.setDrawColor(line); doc.setLineWidth(0.5); doc.line(M, y + 7, R, y + 7);
+      y += 21;
+    });
+    doc.setFont("helvetica", "bold"); doc.text(totalLabel, M + 8, y); doc.text(money(total), R - 8, y, { align: "right" });
+    y += 30;
+  };
+  table("Earnings", earn, "Gross pay", p.gross);
+  if (ded.length) table("Deductions", ded, "Total deductions", p.total_deductions);
+ 
+  doc.setFillColor(gold); doc.roundedRect(M, y - 4, R - M, 44, 6, 6, "F");
+  doc.setTextColor("#17140E"); doc.setFont("helvetica", "bold"); doc.setFontSize(11);
+  doc.text("NET PAY", M + 14, y + 23);
+  doc.setFontSize(16); doc.text(C + " " + money(p.net), R - 14, y + 24, { align: "right" });
+  y += 66;
+  if (p.note) {
+    doc.setFont("helvetica", "normal"); doc.setFontSize(9.5); doc.setTextColor(ink);
+    doc.splitTextToSize("Note: " + p.note, R - M).forEach(l => { doc.text(l, M, y); y += 13; });
+    y += 8;
+  }
+  const foot = 780;
+  doc.setDrawColor("#9B9386"); doc.setLineWidth(0.6);
+  doc.line(M, foot - 34, M + 190, foot - 34); doc.line(R - 190, foot - 34, R, foot - 34);
+  doc.setFont("helvetica", "normal"); doc.setFontSize(8); doc.setTextColor(mut);
+  doc.text("Received by (employee)", M, foot - 22); doc.text("Authorised by", R - 190, foot - 22);
+  doc.text("Private and confidential. Questions about this payslip: speak to the manager before payday.", M, foot + 4);
+  doc.text("Generated " + fmtDayTime(new Date()) + " · La Habana Staff", M, foot + 16);
+}
+async function slipsPdf(slips, run, filename) {
+  busy(true);
+  try {
+    const [{ jsPDF }, logo] = await Promise.all([loadPdfLib(), loadLogo()]);
+    const doc = new jsPDF({ unit: "pt", format: "a4" });
+    slips.forEach((p, i) => { if (i) doc.addPage(); drawSlip(doc, p, run, logo); });
+    doc.save(filename);
+  } catch (e) { toast(e.message || String(e), true); }
+  busy(false);
+}
+const slug = s => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+ 
+function payCsv() {
+  const run = S.payRunRow, list = S.paySlips || [];
+  const head = ["Name", "Employee ID", "Designation", "Pay type", "Hours", "Overtime hours", "Basic", "Overtime", "Holiday premium",
+    "Allowances", "Service charge", "Additions", "Gross", "Deductions", "Net", "Paid by", "Bank", "Account name", "Account number"];
+  const rows = list.map(p => [p.full_name, p.employee_no || "", p.designation || "", p.pay_type, p.hours, p.ot_hours, p.basic, p.ot_pay, p.holiday_pay,
+    p.allowance_total, p.sc_share, (p.additions || []).reduce((n, a) => n + Number(a.amount), 0).toFixed(2),
+    p.gross, p.total_deductions, p.net, p.pay_method || "", p.bank_name || "", p.account_name || "", p.account_no || ""]);
+  const csv = [head].concat(rows).map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(",")).join("\n");
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob(["﻿" + csv], { type: "text/csv" }));
+  a.download = "payroll-" + slug(run.label) + ".csv"; a.click();
+}
+ 
 /* ---------- every tap in the app --------------------------------------- */
 document.addEventListener("click", async e => {
   const el = e.target.closest("[data-act]");
@@ -1518,6 +2013,7 @@ document.addEventListener("click", async e => {
       if (a.act === "profile") return profileSheet();
       if (a.act === "requests") return requestsSheet();
       if (a.act === "docs") return docsSheet();
+      if (a.act === "payslip") { await myPayslipsSheet(); return mySlipSheet(a.v); }
       return;
     }
     case "docs": return docsSheet();
@@ -1705,6 +2201,71 @@ document.addEventListener("click", async e => {
       if (error) return toast(error.message, true);
       S.types = S.types.filter(t => t.id !== v); return shiftTypesSheet();
     }
+    case "payroll": closeSheet(); S.tab = "payroll"; S.payRun = null; return render();
+    case "payrun": S.payRun = v; return render();
+    case "payback": S.payRun = null; return render();
+    case "newrun": return newRunSheet();
+    case "saverun": return saveRun();
+    case "recalc": return recalcRun();
+    case "slip": return slipSheet(v);
+    case "slipadd": {
+      const amt = parseFloat($("sa").value);
+      if (!(amt > 0)) return toast("Put in an amount above zero.", true);
+      const [kind, name] = $("sk").value.split("|");
+      const det = $("sn").value.trim();
+      const item = { name: det ? name + " (" + det + ")" : name, amount: Math.round(amt * 100) / 100 };
+      return slipChange(x => kind === "add" ? { additions: x.additions.concat(item) } : { deductions: x.deductions.concat(item) });
+    }
+    case "slipdel": return slipChange(x => {
+      const key = parts[0] === "add" ? "additions" : "deductions";
+      const list = x[key]; list.splice(Number(parts[1]), 1); return { [key]: list };
+    });
+    case "slipnote": return slipChange(() => ({ note: $("snote").value.trim() || null }));
+    case "slippdf": {
+      const p = S.slipOpen; if (!p) return;
+      return slipsPdf([p], S.payRunRow, "payslip-" + slug(S.payRunRow.label) + "-" + slug(p.full_name) + ".pdf");
+    }
+    case "slipsall": return slipsPdf(S.paySlips || [], S.payRunRow, "payslips-" + slug(S.payRunRow.label) + ".pdf");
+    case "paycsv": return payCsv();
+    case "publishrun": {
+      const run = S.payRunRow, n = (S.paySlips || []).length;
+      return sheet(`<div style="font-weight:600;font-size:18px">Publish ${esc(run.label)}?</div>
+        <p class="sm mut" style="margin:0">${n} people will see their own payslip in the app, and the month locks. You can reopen it later if something needs fixing.</p>
+        <button class="btn" data-act="publishyes">Publish now</button>
+        <button class="btn sec" data-act="closesheet">Not yet</button>`);
+    }
+    case "publishyes": {
+      busy(true);
+      const { error } = await sb.from("pay_runs").update({ status: "published", published_at: new Date().toISOString(), published_by: S.me.id }).eq("id", S.payRun);
+      busy(false);
+      if (error) return toast(error.message, true);
+      closeSheet(); toast("Published. Staff can open their payslips now."); return render();
+    }
+    case "reopenrun": {
+      const { error } = await sb.from("pay_runs").update({ status: "draft", published_at: null, published_by: null }).eq("id", S.payRun);
+      if (error) return toast(error.message, true);
+      toast("Back to draft — staff can't see it until you publish again."); return render();
+    }
+    case "delrun":
+      return sheet(`<div style="font-weight:600;font-size:18px">Delete this draft?</div>
+        <p class="sm mut" style="margin:0">The draft month and its payslips go, including anything you typed on them. Timesheets and pay setup aren't touched.</p>
+        <button class="btn" data-act="delrunyes">Delete the draft</button><button class="btn sec" data-act="closesheet">Keep it</button>`);
+    case "delrunyes": {
+      const { error } = await sb.from("pay_runs").delete().eq("id", S.payRun);
+      if (error) return toast(error.message, true);
+      closeSheet(); S.payRun = null; toast("Draft deleted."); return render();
+    }
+    case "paysetup": return paySetupSheet();
+    case "payedit": return payEditSheet(v);
+    case "paysave": return paySave(v);
+    case "paysettings": return paySettingsSheet();
+    case "paysetsave": return paySettingsSave();
+    case "mypayslips": return myPayslipsSheet();
+    case "myslip": return mySlipSheet(v);
+    case "myslippdf": {
+      const p = (S.mySlips || []).find(x => x.id === v); if (!p) return;
+      return slipsPdf([p], p.pay_runs, "payslip-" + slug(p.pay_runs.label) + ".pdf");
+    }
     case "forgot": {
       const email = ($("em") && $("em").value.trim()) || "";
       if (!email) return toast("Type your email first, then tap this.", true);
@@ -1713,4 +2274,5 @@ document.addEventListener("click", async e => {
     }
   }
 });
+ 
  
