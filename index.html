@@ -77,6 +77,10 @@ button.chip{cursor:pointer;min-height:34px}
 .segmented button{flex:1;padding:9px 6px;border-radius:9px;font-size:13px;font-weight:600;color:var(--muted);min-height:42px}
 .segmented button[aria-pressed="true"]{background:var(--gold);color:#17140E}
 .listitem{display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:13px 14px;width:100%;text-align:left}
+.listitem.unread{border-color:#4A3B1C;background:linear-gradient(160deg,#241E12,var(--surface))}
+.listitem .tail{display:grid;justify-items:end;gap:5px}
+.listitem .count{min-width:22px;height:22px;border-radius:999px;background:var(--gold);color:#17140E;font:700 11px/22px var(--body);text-align:center;padding:0 6px}
+.listitem.flagged{border-color:#5A441A;background:#2A2109}
 .note{border-left:2px solid var(--gold);padding-left:10px;color:var(--muted);font-size:12px}
 .warnbox{background:#2A2109;border:1px solid #574518;border-radius:12px;padding:12px 14px;font-size:12.5px;color:#F0CE8B;display:grid;gap:6px}
 .daypick{display:flex;gap:6px;overflow-x:auto;padding-bottom:4px;margin-bottom:12px}
@@ -170,11 +174,11 @@ label.lbl{font-size:12px;color:var(--muted);display:block;margin-bottom:-4px}
       return tryList(QR, function () { return window.jsQR; });
     })
     .then(function () {
-      return load("config.js?v=3").catch(function () { throw { stop: "config" }; });
+      return load("config.js?v=4").catch(function () { throw { stop: "config" }; });
     })
     .then(function () {
       if (!window.LH || !window.LH.SUPABASE_URL) throw { stop: "config" };
-      return load("app.js?v=3").catch(function () { throw { stop: "app" }; });
+      return load("app.js?v=4").catch(function () { throw { stop: "app" }; });
     })
     .catch(function (e) {
       if (e && e.stop === "library") problem("Can't reach the internet", [
