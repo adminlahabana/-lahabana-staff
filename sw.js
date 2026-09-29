@@ -1,7 +1,7 @@
 // Keeps the app opening instantly and working when the wifi drops.
 // Always tries the network first, so a new version reaches phones on the next open.
-const CACHE = "lh-staff-v4";
-const SHELL = ["./", "./index.html", "./app.js?v=4", "./config.js?v=4", "./manifest.webmanifest"];
+const CACHE = "lh-staff-v5";
+const SHELL = ["./", "./index.html", "./app.js?v=5", "./config.js?v=5", "./manifest.webmanifest"];
  
 self.addEventListener("install", e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
@@ -22,4 +22,5 @@ self.addEventListener("fetch", e => {
     }).catch(() => caches.match(e.request).then(r => r || caches.match("./index.html")))
   );
 });
+ 
  
