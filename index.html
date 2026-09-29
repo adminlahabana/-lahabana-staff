@@ -123,7 +123,7 @@ label.lbl{font-size:12px;color:var(--muted);display:block;margin-bottom:-4px}
 <script>
 /* ---- loader: fetches the two libraries, then the app, and says what failed ---- */
 (function () {
-  var BUILD = "6";
+  var BUILD = "7";
   var notes = [];
   function note(t) { notes.push(t); }
 
@@ -180,11 +180,11 @@ label.lbl{font-size:12px;color:var(--muted);display:block;margin-bottom:-4px}
       return tryList(QR, function () { return window.jsQR; });
     })
     .then(function () {
-      return load("config.js?v=6").catch(function () { throw { stop: "config" }; });
+      return load("config.js?v=7").catch(function () { throw { stop: "config" }; });
     })
     .then(function () {
       if (!window.LH || !window.LH.SUPABASE_URL) throw { stop: "config" };
-      return load("app.js?v=6").catch(function () { throw { stop: "app" }; });
+      return load("app.js?v=7").catch(function () { throw { stop: "app" }; });
     })
     .catch(function (e) {
       if (e && e.stop === "library") problem("Can't reach the internet", [
