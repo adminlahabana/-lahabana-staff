@@ -54,12 +54,34 @@ function hhmm(t) {            // "17:00:00" -> "5:00 PM" (a plain clock time, no
   return hr + ":" + String(m).padStart(2, "0") + " " + ampm;
 }
  
+const fmtDate = iso => iso
+  ? new Intl.DateTimeFormat("en-GB", { timeZone: "UTC", day: "numeric", month: "short", year: "numeric" }).format(new Date(iso + "T12:00:00Z"))
+  : "";
+const daysTo = iso => iso == null || iso === "" ? null
+  : Math.round((new Date(iso + "T12:00:00Z") - new Date(todayISO() + "T12:00:00Z")) / 86400000);
+/* a red or amber flag next to a date that is gone or nearly gone */
+function expChip(iso) {
+  const d = daysTo(iso);
+  if (d === null) return "";
+  if (d < 0) return ' <span class="chip bad">Expired</span>';
+  if (d === 0) return ' <span class="chip bad">Today</span>';
+  if (d <= 30) return ` <span class="chip bad">${d} day${d === 1 ? "" : "s"} left</span>`;
+  if (d <= 90) return ` <span class="chip warn">${d} days left</span>`;
+  return "";
+}
+const DOCS = [["id_expiry", "ID / Passport"], ["insurance_expiry", "Insurance"], ["permit_expiry", "Work permit"]];
+const DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+const BELL = '<svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="1.7" ' +
+  'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+  '<path d="M18 8a6 6 0 1 0-12 0c0 6-2 7-2 7h16s-2-1-2-7"/><path d="M13.7 20a2 2 0 0 1-3.4 0"/></svg>';
+ 
 /* ---------- state ---------------------------------------------------- */
 const S = {
   me: null, people: [], settings: null, types: [],
   tab: "home", shiftsTab: "clock", reportTab: "incidents",
   day: todayISO(), week: mondayOf(todayISO()), chat: null,
-  unread: 0, cache: {}, busy: false, pendingSite: null
+  unread: 0, cache: {}, busy: false, pendingSite: null,
+  hr: null, hrReady: true, alerts: []
 };
 const person = id => S.people.find(p => p.id === id) || { display_name: "Someone", full_name: "Someone" };
 const isMgr = () => S.me && (S.me.role === "manager" || S.me.role === "owner");
@@ -153,6 +175,7 @@ async function bootInner() {
   }
   S.me = prof; S.people = (people || []).filter(p => p.active); S.settings = settings; S.types = types || [];
   if (!prof.display_name || !prof.full_name) return renderProfileSetup();
+  await loadHr();
   $("tabbar").hidden = false;
   watchMessages();
   if (S.pendingSite) { S.tab = "shifts"; S.shiftsTab = "clock"; const code = S.pendingSite; S.pendingSite = null; render(); return punch(code, "tag"); }
@@ -242,17 +265,41 @@ function renderProfileSetup() {
   });
 }
  
+/* ---------- your own employment record -------------------------------- */
+/* Lives in its own table so nobody reads anybody else's passport dates.
+   If the update-1.sql script hasn't been run yet, the app carries on
+   without it instead of breaking. */
+async function loadHr() {
+  try {
+    const { data, error } = await sb.from("staff_hr").select("*").eq("user_id", S.me.id).maybeSingle();
+    if (error) { S.hrReady = false; S.hr = null; return; }
+    S.hrReady = true; S.hr = data || {};
+  } catch (e) { S.hrReady = false; S.hr = null; }
+}
+ 
 /* ---------- shell ----------------------------------------------------- */
 function head(title) {
   return `<div class="apphead">
-      <div class="wordmark">La Habana<span>Staff</span></div>
-      <button class="row" data-act="profile" aria-label="Your profile">
-        <span class="xs mut">${S.me.role === "staff" ? "Staff" : S.me.role === "manager" ? "Manager" : "Owner"}</span>
+      <button class="avatarbtn" data-act="profile" aria-label="Your profile">
         <span class="avatar">${esc(initials(S.me.display_name))}</span></button>
+      <div class="wordmark">La Habana<span>Staff</span></div>
+      <button class="bell${S.alerts.length ? " has" : ""}" data-act="alerts"
+        aria-label="${S.alerts.length ? S.alerts.length + " new notifications" : "Notifications"}">${BELL}${
+        S.alerts.length ? `<span class="dot">${S.alerts.length > 9 ? "9+" : S.alerts.length}</span>` : ""}</button>
     </div>${title ? `<h2 class="title">${esc(title)}</h2>` : ""}`;
 }
+function paintBell() {
+  const b = document.querySelector(".bell");
+  if (!b) return;
+  const n = S.alerts.length;
+  b.innerHTML = BELL + (n ? `<span class="dot">${n > 9 ? "9+" : n}</span>` : "");
+  b.className = "bell" + (n ? " has" : "");
+  b.setAttribute("aria-label", n ? n + " new notifications" : "Notifications");
+}
 function paintTabs() {
-  const tabs = [["home", "Home", "⌂"], ["shifts", "Shifts", "◷"], ["report", "Report", "✎"], ["board", "Board", "▤"], ["chat", "Chat", "✉"]];
+  const tabs = [["home", "Home", "⌂"], ["shifts", "Shifts", "◷"], ["report", "Report", "✎"],
+    ["board", "Board", "▤"], ["chat", "Chat", "✉"]].concat(isMgr() ? [["manage", "Manage", "⚙"]] : []);
+  $("tabbar").style.gridTemplateColumns = "repeat(" + tabs.length + ",1fr)";
   $("tabbar").innerHTML = tabs.map(t => {
     const n = t[0] === "chat" ? S.unread : 0;
     return `<button data-act="tab" data-v="${t[0]}" aria-pressed="${S.tab === t[0]}">
@@ -268,11 +315,79 @@ async function render() {
     else if (S.tab === "report") await viewReport();
     else if (S.tab === "board") await viewBoard();
     else if (S.tab === "chat") await viewChat();
+    else if (S.tab === "manage") await viewManage();
+    refreshAlerts().then(paintBell, () => {});
   } catch (err) {
     screenEl().innerHTML = head("Something went wrong") +
       `<div class="card stack"><p class="sm">${esc(err.message || err)}</p>
        <button class="btn sec" data-act="tab" data-v="${S.tab}">Try again</button></div>`;
   }
+}
+ 
+/* ---------- the bell: what needs your attention ----------------------- */
+let alertsAt = 0;
+async function refreshAlerts(force) {
+  if (!force && Date.now() - alertsAt < 45000) return S.alerts;
+  const items = [];
+  if (S.unread) items.push({ ic: "✉", t: S.unread + " new message" + (S.unread > 1 ? "s" : ""), s: "Chat", act: "tab", v: "chat" });
+ 
+  const [posts, reads] = await Promise.all([
+    sb.from("posts").select("id,title,kind,must_read,created_at").order("created_at", { ascending: false }).limit(20),
+    sb.from("post_reads").select("post_id").eq("user_id", S.me.id)
+  ]);
+  const readIds = new Set(((reads && reads.data) || []).map(r => r.post_id));
+  ((posts && posts.data) || []).filter(p => p.must_read && !readIds.has(p.id)).forEach(p =>
+    items.push({ ic: "▤", t: p.title, s: "Must read · " + p.kind, act: "tab", v: "board" }));
+ 
+  if (S.hr) DOCS.concat([["contract_end", "Contract"]]).forEach(d => {
+    const n = daysTo(S.hr[d[0]]);
+    if (n !== null && n <= 45) items.push({
+      ic: "!", t: "Your " + d[1].toLowerCase() + (n < 0 ? " has expired" : n === 0 ? " expires today" : " expires in " + n + " day" + (n === 1 ? "" : "s")),
+      s: fmtDate(S.hr[d[0]]), act: "profile"
+    });
+  });
+ 
+  if (isMgr()) {
+    const [inc, reqs, jobs, hrAll] = await Promise.all([
+      sb.from("incidents").select("id").is("reviewed_at", null),
+      sb.from("day_off").select("id").eq("status", "pending"),
+      sb.from("jobs").select("id").eq("priority", "Urgent").neq("status", "Fixed"),
+      S.hrReady ? sb.from("staff_hr").select("*") : Promise.resolve({ data: [] })
+    ]);
+    const n1 = ((inc && inc.data) || []).length, n2 = ((reqs && reqs.data) || []).length, n3 = ((jobs && jobs.data) || []).length;
+    if (n1) items.push({ ic: "✎", t: n1 + " incident" + (n1 > 1 ? "s" : "") + " to review", s: "Report", act: "tab", v: "report" });
+    if (n2) items.push({ ic: "◷", t: n2 + " day-off request" + (n2 > 1 ? "s" : ""), s: "Waiting for you", act: "requests" });
+    if (n3) items.push({ ic: "!", t: n3 + " urgent job" + (n3 > 1 ? "s" : "") + " still open", s: "Maintenance", act: "tab", v: "report", sub: "maintenance" });
+    ((hrAll && hrAll.data) || []).forEach(h => {
+      if (h.user_id === S.me.id) return;
+      DOCS.concat([["contract_end", "Contract"]]).forEach(d => {
+        const n = daysTo(h[d[0]]);
+        if (n !== null && n <= 45) items.push({
+          ic: "!", t: (person(h.user_id).display_name || "Someone") + " — " + d[1].toLowerCase() + (n < 0 ? " expired" : " expires in " + n + " day" + (n === 1 ? "" : "s")),
+          s: fmtDate(h[d[0]]), act: "docs"
+        });
+      });
+    });
+  }
+  S.alerts = items; alertsAt = Date.now();
+  return items;
+}
+function bumpChatAlert() {
+  const item = { ic: "\u2709", t: S.unread + " new message" + (S.unread > 1 ? "s" : ""), s: "Chat", act: "tab", v: "chat" };
+  const i = S.alerts.findIndex(a => a.act === "tab" && a.v === "chat");
+  if (i >= 0) S.alerts[i] = item; else S.alerts.unshift(item);
+  paintBell();
+}
+function alertsSheet() {
+  const list = S.alerts;
+  sheet(`<div style="font-weight:600;font-size:18px">Notifications</div>
+    ${list.length ? list.map((a, i) => `<button class="listitem" data-act="alertgo" data-v="${i}">
+        <span class="avatar sm">${esc(a.ic)}</span>
+        <span class="sm">${esc(a.t)}<br><span class="xs mut">${esc(a.s || "")}</span></span>
+        <span class="chip">Open</span></button>`).join("")
+      : '<p class="sm mut" style="margin:0">Nothing new. Everything is read and nothing is waiting on you.</p>'}
+    <button class="btn sec" data-act="refreshalerts">Check again</button>
+    <button class="btn sec" data-act="closesheet">Close</button>`);
 }
  
 /* ---------- home ------------------------------------------------------ */
@@ -310,7 +425,7 @@ async function viewHome() {
         <span class="sm mut">${(onNow || []).map(p => esc(p.display_name)).join(", ") || "Nobody clocked in"}</span></button>
       <button class="tile" data-act="tab" data-v="report"><span class="lbl">${(inc || []).length} to review</span><span class="sm mut">Incidents</span></button>
       <button class="tile" data-act="requests"><span class="lbl">${(reqs || []).length} requests</span><span class="sm mut">Day off</span></button>
-      <button class="tile" data-act="settings"><span class="lbl">Settings</span><span class="sm mut">Venue, staff, shifts</span></button></div>`;
+      <button class="tile" data-act="tab" data-v="manage"><span class="lbl">Manage</span><span class="sm mut">Venue, staff, shifts</span></button></div>`;
   }
  
   screenEl().innerHTML = head("Good evening, " + (S.me.display_name || "").split(" ")[0]) + `
@@ -627,7 +742,7 @@ function watchMessages() {
       const inThisThread = S.tab === "chat" && S.chat &&
         ((S.chat === "all" && !m.recipient) || (S.chat === m.sender && m.recipient === S.me.id));
       if (inThisThread) viewChat();
-      else { S.unread++; paintTabs(); if (S.tab === "chat") viewChat(); }
+      else { S.unread++; paintTabs(); bumpChatAlert(); if (S.tab === "chat") viewChat(); }
     }).subscribe();
 }
 async function viewChat() {
@@ -636,6 +751,7 @@ async function viewChat() {
   const msgs = (data || []).slice().reverse();
   if (!S.chat) {
     S.unread = 0; paintTabs();
+    S.alerts = S.alerts.filter(a => !(a.act === "tab" && a.v === "chat")); paintBell();
     const threads = [{ id: "all", name: "All staff" }].concat(
       S.people.filter(p => p.id !== S.me.id).map(p => ({ id: p.id, name: p.display_name })));
     screenEl().innerHTML = head("Chat") + `<div class="stack">${threads.map(t => {
@@ -1029,40 +1145,130 @@ function fixShiftSheet() {
     <button class="btn" data-act="msgmanager">Message a manager</button>
     <button class="btn sec" data-act="closesheet">Close</button>`);
 }
+/* ---------- your profile ---------------------------------------------- */
+const kv = (label, value, chip) =>
+  `<div class="kv"><span class="xs mut">${esc(label)}</span><span class="sm">${value ? esc(value) : '<span class="mut">—</span>'}${chip || ""}</span></div>`;
+ 
 async function profileSheet() {
-  sheet(`<div style="font-weight:600;font-size:18px">${esc(S.me.display_name)}</div>
-    <div class="sm mut">${esc(S.me.full_name || "")} · ${esc(S.me.role)}${S.me.position ? " · " + esc(S.me.position) : ""}</div>
-    <label class="lbl" for="mdn">Short name</label><input id="mdn" value="${esc(S.me.display_name || "")}">
-    <label class="lbl" for="mph">Phone</label><input id="mph" value="${esc(S.me.phone || "")}">
-    <button class="btn" data-act="saveprofile">Save</button>
-    ${isMgr() ? '<button class="btn sec" data-act="settings">Settings</button>' : ""}
+  if (S.hrReady && !S.hr) await loadHr();
+  const hr = S.hr || {};
+  const roleName = S.me.role === "staff" ? "Staff" : S.me.role === "manager" ? "Manager" : "Owner";
+  const dateRow = (label, iso) => kv(label, fmtDate(iso), expChip(iso));
+  sheet(`<div class="row" style="gap:14px;align-items:center">
+      <span class="avatar" style="width:52px;height:52px;font-size:17px">${esc(initials(S.me.display_name))}</span>
+      <span><span style="font-weight:600;font-size:18px">${esc(S.me.full_name || S.me.display_name)}</span><br>
+        <span class="sm mut">${esc(S.me.position || "No designation set")} · ${roleName}</span></span></div>
+    ${kv("Employee ID", hr.employee_no || "")}
+    <h3 class="sec" style="margin:14px 0 0">Details</h3>
+    ${kv("Phone", S.me.phone || "")}
+    ${kv("Contract start", fmtDate(hr.contract_start))}
+    ${dateRow("Contract end", hr.contract_end)}
+    ${kv("Available off day", hr.off_day || "")}
+    <h3 class="sec" style="margin:14px 0 0">Documents</h3>
+    ${DOCS.map(d => dateRow(d[1], hr[d[0]])).join("")}
+    ${S.hrReady ? "" : `<p class="xs mut" style="margin:6px 0 0">Employment details aren't switched on yet${isOwner() ? " — run <b>update-1.sql</b> in Supabase → SQL Editor." : " — ask the owner."}</p>`}
+    ${S.hrReady && isMgr() ? '<p class="xs mut" style="margin:6px 0 0">Managers fill these in under Manage → Staff.</p>'
+      : S.hrReady ? '<p class="xs mut" style="margin:6px 0 0">Your manager keeps these up to date. Tell them if anything here is wrong.</p>' : ""}
+    <button class="btn sec" data-act="editme">Edit my name and phone</button>
     <button class="btn sec" data-act="signout">Sign out</button>`);
 }
+function editMeSheet() {
+  sheet(`<div style="font-weight:600;font-size:18px">Your name and phone</div>
+    <label class="lbl" for="mdn">Short name staff will see</label><input id="mdn" value="${esc(S.me.display_name || "")}">
+    <label class="lbl" for="mph">Phone</label><input id="mph" inputmode="tel" value="${esc(S.me.phone || "")}">
+    <button class="btn" data-act="saveprofile">Save</button>
+    <button class="btn sec" data-act="profile">Back</button>`);
+}
  
-/* ---------- settings ---------------------------------------------------- */
-async function settingsSheet() {
+/* ---------- manage (managers and the owner) --------------------------- */
+async function viewManage() {
   const s = S.settings || {};
-  sheet(`<div style="font-weight:600;font-size:18px">Settings</div>
+  const [inc, reqs, hrAll] = await Promise.all([
+    sb.from("incidents").select("id").is("reviewed_at", null),
+    sb.from("day_off").select("id").eq("status", "pending"),
+    S.hrReady ? sb.from("staff_hr").select("*") : Promise.resolve({ data: [] })
+  ]);
+  const soon = ((hrAll && hrAll.data) || []).reduce((n, h) =>
+    n + DOCS.concat([["contract_end", "Contract"]]).filter(d => { const x = daysTo(h[d[0]]); return x !== null && x <= 45; }).length, 0);
+  screenEl().innerHTML = head("Manage") + `
+    <h3 class="sec" style="margin-top:0">People</h3>
+    <div class="grid2">
+      <button class="tile" data-act="staff"><span class="lbl">Staff</span><span class="sm mut">${S.people.length} active · roles, details</span></button>
+      <button class="tile" data-act="requests"><span class="lbl">${((reqs && reqs.data) || []).length} request${((reqs && reqs.data) || []).length === 1 ? "" : "s"}</span><span class="sm mut">Day off</span></button>
+      <button class="tile" data-act="docs"><span class="lbl">Documents</span><span class="sm mut">${soon ? soon + " need attention" : "All in date"}</span></button>
+      <button class="tile" data-act="shifttypes"><span class="lbl">Shift types</span><span class="sm mut">${S.types.length} set up</span></button>
+    </div>
+    <h3 class="sec">Tonight</h3>
+    <div class="grid2">
+      <button class="tile" data-act="tab" data-v="report"><span class="lbl">${((inc && inc.data) || []).length} to review</span><span class="sm mut">Incidents</span></button>
+      <button class="tile" data-act="tab" data-v="shifts" data-sub="timesheet"><span class="lbl">Timesheet</span><span class="sm mut">Hours and corrections</span></button>
+    </div>
     ${isOwner() ? `
-      <label class="lbl" for="vn">Venue name</label><input id="vn" value="${esc(s.venue_name || "")}">
-      <label class="lbl">Venue location</label>
-      <div class="row"><input id="vlat" placeholder="latitude" value="${s.venue_lat ?? ""}" inputmode="decimal" style="flex:1">
-        <input id="vlng" placeholder="longitude" value="${s.venue_lng ?? ""}" inputmode="decimal" style="flex:1"></div>
-      <button class="btn sec" data-act="hereloc">Use my location right now</button>
-      <label class="lbl" for="vrad">How close staff must be (metres)</label><input id="vrad" type="number" value="${s.radius_m ?? 150}">
-      <label class="lbl" for="vloy">Loyalty console link</label><input id="vloy" value="${esc(s.loyalty_url || "")}" placeholder="https://script.google.com/…/exec?page=staff">
-      <label class="lbl" for="vareas">Areas (one per line)</label><textarea id="vareas" rows="4">${esc((s.areas || []).join("\n"))}</textarea>
-      <label class="lbl" for="vpos">Positions (one per line)</label><textarea id="vpos" rows="3">${esc((s.positions || []).join("\n"))}</textarea>
-      <button class="btn" data-act="savesettings">Save settings</button>
-      <div class="card stack"><div class="sm"><b>Clock-in code</b></div>
+      <h3 class="sec">Venue</h3>
+      <div class="card stack">
+        <label class="lbl" for="vn">Venue name</label><input id="vn" value="${esc(s.venue_name || "")}">
+        <label class="lbl">Venue location</label>
+        <div class="row"><input id="vlat" placeholder="latitude" value="${s.venue_lat ?? ""}" inputmode="decimal" style="flex:1">
+          <input id="vlng" placeholder="longitude" value="${s.venue_lng ?? ""}" inputmode="decimal" style="flex:1"></div>
+        <button class="btn sec" data-act="hereloc">Use my location right now</button>
+        <label class="lbl" for="vrad">How close staff must be (metres)</label><input id="vrad" type="number" value="${s.radius_m ?? 150}">
+        <label class="lbl" for="vloy">Loyalty console link</label><input id="vloy" value="${esc(s.loyalty_url || "")}" placeholder="https://script.google.com/…/exec?page=staff">
+        <label class="lbl" for="vareas">Areas (one per line)</label><textarea id="vareas" rows="4">${esc((s.areas || []).join("\n"))}</textarea>
+        <label class="lbl" for="vpos">Positions (one per line)</label><textarea id="vpos" rows="3">${esc((s.positions || []).join("\n"))}</textarea>
+        <button class="btn" data-act="savesettings">Save settings</button>
+      </div>
+      <h3 class="sec">Clock-in code</h3>
+      <div class="card stack">
         <div class="xs mono" style="overflow-wrap:anywhere">${esc(s.site_code || "")}</div>
         <div class="xs mut" style="overflow-wrap:anywhere">QR link: ${esc(location.origin + location.pathname + "?site=" + (s.site_code || ""))}</div>
         <button class="btn sec sm" data-act="qrposter">Show the QR poster</button>
-        <button class="btn sec sm" data-act="newcode">New code (old QR stops working)</button></div>
-      <button class="btn sec" data-act="staff">Staff and roles</button>` : ""}
-    <button class="btn sec" data-act="shifttypes">Shift types</button>
+        <button class="btn sec sm" data-act="newcode">New code (old QR stops working)</button>
+      </div>` : ""}`;
+}
+async function docsSheet() {
+  if (!S.hrReady) return toast("Run update-1.sql in Supabase first.", true);
+  const { data } = await sb.from("staff_hr").select("*");
+  const fields = DOCS.concat([["contract_end", "Contract end"]]);
+  const rows = [];
+  (data || []).forEach(h => fields.forEach(f => {
+    const n = daysTo(h[f[0]]);
+    if (n !== null && n <= 120) rows.push({ n, who: person(h.user_id).display_name, uid: h.user_id, what: f[1], iso: h[f[0]] });
+  }));
+  rows.sort((a, b) => a.n - b.n);
+  sheet(`<div style="font-weight:600;font-size:18px">Documents</div>
+    <p class="xs mut" style="margin:0">Anything expired or running out in the next four months.</p>
+    ${rows.length ? rows.map(r => `<button class="listitem" data-act="hr" data-v="${r.uid}">
+        <span class="avatar sm">${esc(initials(r.who))}</span>
+        <span class="sm">${esc(r.who)} — ${esc(r.what.toLowerCase())}<br><span class="xs mut">${fmtDate(r.iso)}</span></span>
+        ${expChip(r.iso) || '<span class="chip">' + r.n + ' days</span>'}</button>`).join("")
+      : '<p class="sm mut" style="margin:0">Nothing expiring. Everyone is in date.</p>'}
     <button class="btn sec" data-act="closesheet">Close</button>`);
 }
+async function hrSheet(uid) {
+  const p = person(uid);
+  if (!S.hrReady) return toast("Run update-1.sql in Supabase first.", true);
+  const { data } = await sb.from("staff_hr").select("*").eq("user_id", uid).maybeSingle();
+  const h = data || {};
+  const d = (id, label, val) => `<label class="lbl" for="${id}">${label}</label><input id="${id}" type="date" value="${val || ""}">`;
+  sheet(`<div style="font-weight:600;font-size:18px">${esc(p.display_name || "Staff")}</div>
+    <div class="sm mut">${esc(p.full_name || "")}</div>
+    <label class="lbl" for="hno">Employee ID</label><input id="hno" value="${esc(h.employee_no || "")}" placeholder="LH-004">
+    <label class="lbl" for="hpos">Designation</label>
+    <select id="hpos"><option value="">none</option>${posOptions(p.position)}</select>
+    <h3 class="sec" style="margin:14px 0 0">Details</h3>
+    ${d("hcs", "Contract start", h.contract_start)}
+    ${d("hce", "Contract end", h.contract_end)}
+    <label class="lbl" for="hoff">Available off day</label>
+    <select id="hoff"><option value="">not set</option>${DAYS.map(x => `<option${h.off_day === x ? " selected" : ""}>${x}</option>`).join("")}</select>
+    <h3 class="sec" style="margin:14px 0 0">Documents</h3>
+    ${d("hid", "ID / Passport expiry", h.id_expiry)}
+    ${d("hins", "Insurance expiry", h.insurance_expiry)}
+    ${d("hwp", "Work permit expiry", h.permit_expiry)}
+    <label class="lbl" for="hnote">Note (managers only)</label><textarea id="hnote" rows="2">${esc(h.note || "")}</textarea>
+    <button class="btn" data-act="savehr" data-v="${uid}">Save details</button>
+    <button class="btn sec" data-act="staff">Back to staff</button>`);
+}
+ 
 async function staffSheet() {
   const { data } = await sb.from("profiles").select("*").order("display_name");
   sheet(`<div style="font-weight:600;font-size:18px">Staff</div>
@@ -1078,6 +1284,7 @@ async function staffSheet() {
         <select data-pos-for="${p.id}" style="flex:1"><option value="">position…</option>${posOptions(p.position)}</select>
       </div>
       <div class="row"><button class="btn sm" data-act="saveperson" data-v="${p.id}">Save</button>
+        <button class="btn sec sm" data-act="hr" data-v="${p.id}">Details</button>
         <button class="btn sec sm" data-act="toggleperson" data-v="${p.id}|${p.active ? "off" : "on"}">${p.active ? "Deactivate" : "Reactivate"}</button></div>
     </div>`).join("")}</div>
     <button class="btn sec" data-act="closesheet">Close</button>`);
@@ -1139,7 +1346,50 @@ document.addEventListener("click", async e => {
     case "week": S.week = addDays(S.week, Number(v)); if (S.day < S.week || S.day > addDays(S.week, 6)) S.day = S.week; return viewShifts();
     case "closesheet": return closeSheet();
     case "profile": return profileSheet();
-    case "settings": closeSheet(); return settingsSheet();
+    case "editme": return editMeSheet();
+    case "settings": closeSheet(); S.tab = "manage"; return render();
+    case "alerts": return alertsSheet();
+    case "refreshalerts": {
+      busy(true); await refreshAlerts(true); busy(false);
+      paintBell(); return alertsSheet();
+    }
+    case "alertgo": {
+      const a = S.alerts[Number(v)];
+      closeSheet();
+      if (!a) return;
+      if (a.act === "tab") { S.chat = null; if (a.sub) { S.reportTab = a.sub; S.shiftsTab = a.sub; } S.tab = a.v; return render(); }
+      if (a.act === "profile") return profileSheet();
+      if (a.act === "requests") return requestsSheet();
+      if (a.act === "docs") return docsSheet();
+      return;
+    }
+    case "docs": return docsSheet();
+    case "hr": return hrSheet(v);
+    case "savehr": {
+      const patch = {
+        user_id: v,
+        employee_no: $("hno").value.trim() || null,
+        contract_start: $("hcs").value || null,
+        contract_end: $("hce").value || null,
+        off_day: $("hoff").value || null,
+        id_expiry: $("hid").value || null,
+        insurance_expiry: $("hins").value || null,
+        permit_expiry: $("hwp").value || null,
+        note: $("hnote").value.trim() || null
+      };
+      const pos = $("hpos").value || null;
+      busy(true);
+      const [{ error: e1 }, { error: e2 }] = await Promise.all([
+        sb.from("staff_hr").upsert(patch, { onConflict: "user_id" }),
+        sb.from("profiles").update({ position: pos }).eq("id", v)
+      ]);
+      busy(false);
+      if (e1 || e2) return toast((e1 || e2).message, true);
+      const me = S.people.find(p => p.id === v); if (me) me.position = pos;
+      if (v === S.me.id) { S.me.position = pos; await loadHr(); }
+      await refreshAlerts(true); paintBell();
+      toast("Details saved."); return staffSheet();
+    }
     case "staff": return staffSheet();
     case "shifttypes": return shiftTypesSheet();
     case "qrposter": return qrPoster();
@@ -1239,7 +1489,7 @@ document.addEventListener("click", async e => {
       const patch = { display_name: $("mdn").value.trim(), phone: $("mph").value.trim() };
       const { error } = await sb.from("profiles").update(patch).eq("id", S.me.id);
       if (error) return toast(error.message, true);
-      Object.assign(S.me, patch); closeSheet(); toast("Saved."); return render();
+      Object.assign(S.me, patch); toast("Saved."); render(); return profileSheet();
     }
     case "hereloc": {
       const c = await getLocation();
