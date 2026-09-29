@@ -81,7 +81,8 @@ const S = {
   tab: "home", shiftsTab: "clock", reportTab: "incidents",
   day: todayISO(), week: mondayOf(todayISO()), chat: null,
   unread: 0, cache: {}, busy: false, pendingSite: null,
-  hr: null, hrReady: true, alerts: []
+  hr: null, hrReady: true, alerts: [],
+  threadUnread: {}, reads: {}, readsReady: true, lastReadWrite: 0
 };
 const person = id => S.people.find(p => p.id === id) || { display_name: "Someone", full_name: "Someone" };
 const isMgr = () => S.me && (S.me.role === "manager" || S.me.role === "owner");
@@ -176,6 +177,8 @@ async function bootInner() {
   S.me = prof; S.people = (people || []).filter(p => p.active); S.settings = settings; S.types = types || [];
   if (!prof.display_name || !prof.full_name) return renderProfileSetup();
   await loadHr();
+  await loadReads();
+  await refreshUnread().catch(() => {});
   $("tabbar").hidden = false;
   watchMessages();
   if (S.pendingSite) { S.tab = "shifts"; S.shiftsTab = "clock"; const code = S.pendingSite; S.pendingSite = null; render(); return punch(code, "tag"); }
@@ -277,6 +280,57 @@ async function loadHr() {
   } catch (e) { S.hrReady = false; S.hr = null; }
 }
  
+/* ---------- unread messages, per conversation -------------------------- */
+/* A thread is "all" (everyone) or the other person's id. What you have read
+   is remembered in the database, so the count is the same on every device. */
+const threadKey = m => m.recipient ? (m.sender === S.me.id ? m.recipient : m.sender) : "all";
+const threadName = k => k === "all" ? "All staff" : (person(k).display_name || "Someone");
+const totalUnread = () => Object.keys(S.threadUnread).reduce((n, k) => n + (S.threadUnread[k] || 0), 0);
+ 
+async function loadReads() {
+  try {
+    const { data, error } = await sb.from("chat_reads").select("*").eq("user_id", S.me.id);
+    if (error) { S.readsReady = false; return; }
+    S.readsReady = true; S.reads = {};
+    (data || []).forEach(r => { S.reads[r.thread] = r.last_read_at; });
+  } catch (e) { S.readsReady = false; }
+}
+/* Counts what arrived after you last opened each conversation. A conversation
+   you have never opened only counts the last three days, so nobody comes back
+   from leave to a badge of 200. */
+async function refreshUnread() {
+  if (!S.readsReady) return;
+  const { data, error } = await sb.from("messages").select("id,sender,recipient,created_at")
+    .order("created_at", { ascending: false }).limit(400);
+  if (error) return;
+  const fresh = new Date(Date.now() - 3 * 86400e3).toISOString();
+  const counts = {};
+  (data || []).forEach(m => {
+    if (m.sender === S.me.id) return;
+    const k = threadKey(m);
+    const seen = S.reads[k];
+    if (m.created_at <= (seen || fresh)) return;
+    counts[k] = (counts[k] || 0) + 1;
+  });
+  S.threadUnread = counts;
+  S.unread = totalUnread();
+}
+async function markRead(key) {
+  const had = S.threadUnread[key] || 0;
+  S.threadUnread[key] = 0;
+  S.unread = totalUnread();
+  paintTabs();
+  S.alerts = S.alerts.filter(a => !(a.act === "chat" && a.v === key));
+  paintBell();
+  if (!S.readsReady) return;
+  if (!had && Date.now() - S.lastReadWrite < 8000) return;   // don't write on every keystroke of a live chat
+  S.lastReadWrite = Date.now();
+  const at = new Date().toISOString();
+  S.reads[key] = at;
+  try { await sb.from("chat_reads").upsert({ user_id: S.me.id, thread: key, last_read_at: at }, { onConflict: "user_id,thread" }); }
+  catch (e) { /* a lost read marker is not worth an error message */ }
+}
+ 
 /* ---------- shell ----------------------------------------------------- */
 function head(title) {
   return `<div class="apphead">
@@ -329,7 +383,11 @@ let alertsAt = 0;
 async function refreshAlerts(force) {
   if (!force && Date.now() - alertsAt < 45000) return S.alerts;
   const items = [];
-  if (S.unread) items.push({ ic: "✉", t: S.unread + " new message" + (S.unread > 1 ? "s" : ""), s: "Chat", act: "tab", v: "chat" });
+  await refreshUnread().catch(() => {});
+  Object.keys(S.threadUnread).forEach(k => {
+    const n = S.threadUnread[k];
+    if (n) items.push({ ic: "✉", t: threadName(k) + " — " + n + " new message" + (n > 1 ? "s" : ""), s: "Chat", act: "chat", v: k });
+  });
  
   const [posts, reads] = await Promise.all([
     sb.from("posts").select("id,title,kind,must_read,created_at").order("created_at", { ascending: false }).limit(20),
@@ -354,6 +412,14 @@ async function refreshAlerts(force) {
       sb.from("jobs").select("id").eq("priority", "Urgent").neq("status", "Fixed"),
       S.hrReady ? sb.from("staff_hr").select("*") : Promise.resolve({ data: [] })
     ]);
+    const { data: openNow } = await sb.from("shifts").select("*").is("ended_at", null);
+    (openNow || []).forEach(o => {
+      const mins = (Date.now() - new Date(o.started_at)) / 60000;
+      if (mins > 10 * 60) items.push({
+        ic: "◷", t: (person(o.user_id).display_name || "Someone") + " is still clocked in — " + hours(mins),
+        s: "Probably forgot. Tap to clock them out.", act: "tab", v: "shifts", sub: "timesheet"
+      });
+    });
     const n1 = ((inc && inc.data) || []).length, n2 = ((reqs && reqs.data) || []).length, n3 = ((jobs && jobs.data) || []).length;
     if (n1) items.push({ ic: "✎", t: n1 + " incident" + (n1 > 1 ? "s" : "") + " to review", s: "Report", act: "tab", v: "report" });
     if (n2) items.push({ ic: "◷", t: n2 + " day-off request" + (n2 > 1 ? "s" : ""), s: "Waiting for you", act: "requests" });
@@ -372,10 +438,13 @@ async function refreshAlerts(force) {
   S.alerts = items; alertsAt = Date.now();
   return items;
 }
-function bumpChatAlert() {
-  const item = { ic: "\u2709", t: S.unread + " new message" + (S.unread > 1 ? "s" : ""), s: "Chat", act: "tab", v: "chat" };
-  const i = S.alerts.findIndex(a => a.act === "tab" && a.v === "chat");
-  if (i >= 0) S.alerts[i] = item; else S.alerts.unshift(item);
+/* keep the bell honest between refreshes, without another round trip */
+function chatAlerts() {
+  S.alerts = S.alerts.filter(a => a.act !== "chat");
+  Object.keys(S.threadUnread).forEach(k => {
+    const n = S.threadUnread[k];
+    if (n) S.alerts.unshift({ ic: "\u2709", t: threadName(k) + " — " + n + " new message" + (n > 1 ? "s" : ""), s: "Chat", act: "chat", v: k });
+  });
   paintBell();
 }
 function alertsSheet() {
@@ -600,11 +669,21 @@ async function scheduleBody() {
 /* ---------- shifts: timesheet ---------------------------------------- */
 async function timesheetBody() {
   const from = S.week + "T00:00:00Z", to = addDays(S.week, 7) + "T00:00:00Z";
-  const [{ data: shifts }, { data: sched }, { data: rejected }] = await Promise.all([
+  const [{ data: shifts }, { data: sched }, { data: rejected }, { data: openNow }] = await Promise.all([
     sb.from("shifts").select("*").gte("started_at", from).lt("started_at", to).order("started_at"),
     sb.from("schedule").select("*").eq("week_start", S.week),
-    sb.from("punches").select("*").eq("accepted", false).gte("at", addDays(todayISO(), -30) + "T00:00:00Z").order("at", { ascending: false }).limit(20)
+    sb.from("punches").select("*").eq("accepted", false).gte("at", addDays(todayISO(), -30) + "T00:00:00Z").order("at", { ascending: false }).limit(20),
+    sb.from("shifts").select("*").is("ended_at", null).order("started_at")
   ]);
+  const stillIn = (openNow || []).map(s => {
+    const mins = (Date.now() - new Date(s.started_at)) / 60000;
+    const long = mins > 10 * 60;
+    return `<div class="listitem${long ? " flagged" : ""}">
+      <span class="avatar sm">${esc(initials(person(s.user_id).display_name))}</span>
+      <span class="sm">${esc(person(s.user_id).display_name)}<br>
+        <span class="xs mut">In since ${fmtDayTime(s.started_at)} · ${hours(mins)}${long ? " · probably forgot" : ""}</span></span>
+      <button class="chip gold" data-act="forceout" data-v="${s.id}">Clock out</button></div>`;
+  }).join("");
   const rows = S.people.map(p => {
     const mine = (shifts || []).filter(s => s.user_id === p.id);
     const worked = mine.reduce((n, s) => n + (s.ended_at ? (new Date(s.ended_at) - new Date(s.started_at)) / 60000 : 0), 0);
@@ -633,6 +712,8 @@ async function timesheetBody() {
       <button class="chip" data-act="week" data-v="-7">‹ Earlier</button>
       <span class="sm mut mono">${dayLabel(S.week)} – ${dayLabel(addDays(S.week, 6))}</span>
       <button class="chip" data-act="week" data-v="7">Later ›</button></div>
+    ${stillIn ? `<h3 class="sec" style="margin-top:0">On shift now</h3><div class="stack">${stillIn}</div>` : ""}
+    <h3 class="sec">${stillIn ? "This week" : ""}</h3>
     <div class="stack">${rows}</div>
     <h3 class="sec">Every shift this week</h3><div class="stack">${shiftList || '<p class="sm mut">No clock-ins this week.</p>'}</div>
     <h3 class="sec">Refused clock-ins (30 days)</h3><div class="stack">${(rejected || []).map(r => `
@@ -739,10 +820,14 @@ function watchMessages() {
     .on("postgres_changes", { event: "INSERT", schema: "public", table: "messages" }, p => {
       const m = p.new;
       if (m.sender === S.me.id) return;
-      const inThisThread = S.tab === "chat" && S.chat &&
-        ((S.chat === "all" && !m.recipient) || (S.chat === m.sender && m.recipient === S.me.id));
+      const k = threadKey(m);
+      const inThisThread = S.tab === "chat" && S.chat === k;
       if (inThisThread) viewChat();
-      else { S.unread++; paintTabs(); bumpChatAlert(); if (S.tab === "chat") viewChat(); }
+      else {
+        S.threadUnread[k] = (S.threadUnread[k] || 0) + 1;
+        S.unread = totalUnread();
+        paintTabs(); chatAlerts(); if (S.tab === "chat") viewChat();
+      }
     }).subscribe();
 }
 async function viewChat() {
@@ -750,22 +835,33 @@ async function viewChat() {
   if (error) throw error;
   const msgs = (data || []).slice().reverse();
   if (!S.chat) {
-    S.unread = 0; paintTabs();
-    S.alerts = S.alerts.filter(a => !(a.act === "tab" && a.v === "chat")); paintBell();
+    paintTabs();
     const threads = [{ id: "all", name: "All staff" }].concat(
       S.people.filter(p => p.id !== S.me.id).map(p => ({ id: p.id, name: p.display_name })));
-    screenEl().innerHTML = head("Chat") + `<div class="stack">${threads.map(t => {
+    /* newest conversation first, but All staff always on top */
+    const lastOf = t => {
       const list = t.id === "all" ? msgs.filter(m => !m.recipient)
         : msgs.filter(m => m.recipient && (m.sender === t.id || m.recipient === t.id));
-      const last = list[list.length - 1];
-      return `<button class="listitem" data-act="openchat" data-v="${t.id}">
+      return list[list.length - 1];
+    };
+    threads.sort((a, b) => {
+      if (a.id === "all") return -1; if (b.id === "all") return 1;
+      const la = lastOf(a), lb = lastOf(b);
+      return (lb ? lb.created_at : "").localeCompare(la ? la.created_at : "");
+    });
+    screenEl().innerHTML = head("Chat") + `<div class="stack">${threads.map(t => {
+      const last = lastOf(t);
+      const n = S.threadUnread[t.id] || 0;
+      return `<button class="listitem${n ? " unread" : ""}" data-act="openchat" data-v="${t.id}">
         <span class="avatar sm">${t.id === "all" ? "★" : esc(initials(t.name))}</span>
         <span class="sm">${esc(t.name)}<br><span class="xs mut">${last ? esc(last.body.slice(0, 40)) : "No messages yet"}</span></span>
-        <span class="xs mut mono">${last ? fmtTime(last.created_at) : ""}</span></button>`;
+        <span class="tail">${n ? `<span class="count">${n > 99 ? "99+" : n}</span>` : ""}
+          <span class="xs mut mono">${last ? fmtTime(last.created_at) : ""}</span></span></button>`;
     }).join("")}</div>
     <p class="note" style="margin-top:16px">Everyone is in All staff. A private message is only seen by the two of you.</p>`;
     return;
   }
+  markRead(S.chat);
   const name = S.chat === "all" ? "All staff" : person(S.chat).display_name;
   const list = S.chat === "all" ? msgs.filter(m => !m.recipient)
     : msgs.filter(m => m.recipient && (m.sender === S.chat || m.recipient === S.chat));
@@ -1139,6 +1235,66 @@ async function saveShift(id) {
   if (error) return toast(error.message, true);
   closeSheet(); render(); toast("Shift updated.");
 }
+/* A manager closing a shift somebody forgot to close. The original start is
+   untouched, the correction is signed, and the reason is kept for good. */
+async function forceOutSheet(id) {
+  const { data: sh } = await sb.from("shifts").select("*").eq("id", id).maybeSingle();
+  if (!sh) return toast("That shift is already closed.", true);
+  const p = person(sh.user_id);
+  const mins = (Date.now() - new Date(sh.started_at)) / 60000;
+  /* what the schedule says they should have finished today */
+  const { data: sc } = await sb.from("schedule").select("*").eq("user_id", sh.user_id)
+    .gte("day", sh.started_at.slice(0, 10)).lte("day", todayISO()).order("day", { ascending: false }).limit(1);
+  const row = (sc || [])[0];
+  const type = row && S.types.find(t => t.id === row.type_id);
+  const endStr = type ? type.ends : (row && row.ends) || "";
+  let planned = "";
+  if (endStr) {
+    const startDay = new Intl.DateTimeFormat("en-CA", { timeZone: TZ }).format(new Date(sh.started_at));
+    const [h] = endStr.split(":").map(Number);
+    const startHour = Number(new Intl.DateTimeFormat("en-GB", { timeZone: TZ, hour: "2-digit", hour12: false }).format(new Date(sh.started_at)));
+    const day = h < startHour ? addDays(startDay, 1) : startDay;   // a shift that ends after midnight
+    planned = day + "T" + endStr.slice(0, 5);
+    const at = new Date(planned + ":00+05:00");
+    if (!(at > new Date(sh.started_at) && at.getTime() <= Date.now() + 60000)) planned = "";  // only offer it if it makes sense
+  }
+  const localNow = new Date(Date.now() + 5 * 3600e3).toISOString().slice(0, 16);
+  sheet(`<div style="font-weight:600;font-size:18px">Clock out ${esc(p.display_name)}</div>
+    <div class="sm mut">Clocked in ${fmtDayTime(sh.started_at)} — that is ${hours(mins)} ago.</div>
+    <label class="lbl">When did they actually finish?</label>
+    <div class="row">
+      <button class="chip gold" data-act="outpick" data-v="${localNow}">Now</button>
+      ${planned ? `<button class="chip" data-act="outpick" data-v="${planned}">Scheduled finish ${hhmm(endStr)}</button>` : ""}
+    </div>
+    <input id="oe" type="datetime-local" value="${planned || localNow}">
+    <label class="lbl" for="or">Why are you clocking them out?</label>
+    <input id="or" value="Forgot to clock out" placeholder="Forgot to clock out — checked with the manager on duty">
+    <button class="btn" data-act="saveforceout" data-v="${id}">Clock them out</button>
+    <p class="xs mut" style="margin:0">Your name and this reason are saved with the shift, and the hours change on the timesheet.</p>
+    <button class="btn sec" data-act="closesheet">Cancel</button>`);
+}
+async function saveForceOut(id) {
+  const reason = $("or").value.trim();
+  if (!reason) return toast("Put a reason — it stays on the record.", true);
+  const val = $("oe").value;
+  if (!val) return toast("Pick the finishing time.", true);
+  const ended = new Date(val + ":00+05:00");
+  const { data: sh } = await sb.from("shifts").select("*").eq("id", id).maybeSingle();
+  if (!sh) return toast("That shift is already closed.", true);
+  if (ended <= new Date(sh.started_at)) return toast("The finish has to be after " + fmtDayTime(sh.started_at) + ".", true);
+  if (ended.getTime() > Date.now() + 60000) return toast("That time hasn't happened yet.", true);
+  busy(true);
+  const { error } = await sb.from("shifts").update({
+    ended_at: ended.toISOString(), edited_by: S.me.id,
+    edit_reason: reason, auto_closed: false
+  }).eq("id", id);
+  busy(false);
+  if (error) return toast(error.message, true);
+  closeSheet();
+  toast(person(sh.user_id).display_name + " clocked out at " + fmtTime(ended) + ".");
+  await refreshAlerts(true); paintBell();
+  return render();
+}
 function fixShiftSheet() {
   sheet(`<div style="font-weight:600;font-size:18px">Forgot to clock out?</div>
     <p class="sm mut" style="margin:0">Send a manager a message with the time you actually finished — they can correct it on the timesheet.</p>
@@ -1357,6 +1513,7 @@ document.addEventListener("click", async e => {
       const a = S.alerts[Number(v)];
       closeSheet();
       if (!a) return;
+      if (a.act === "chat") { S.tab = "chat"; S.chat = a.v; return render(); }
       if (a.act === "tab") { S.chat = null; if (a.sub) { S.reportTab = a.sub; S.shiftsTab = a.sub; } S.tab = a.v; return render(); }
       if (a.act === "profile") return profileSheet();
       if (a.act === "requests") return requestsSheet();
@@ -1481,6 +1638,9 @@ document.addEventListener("click", async e => {
     case "openchat": S.chat = v; return viewChat();
     case "chatback": S.chat = null; return viewChat();
  
+    case "forceout": return forceOutSheet(v);
+    case "outpick": { const el = $("oe"); if (el) el.value = v; return; }
+    case "saveforceout": return saveForceOut(v);
     case "editshift": return editShiftSheet(v);
     case "saveshift": return saveShift(v);
     case "csv": return csvExport();
