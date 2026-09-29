@@ -418,7 +418,7 @@ async function refreshAlerts(force) {
       if (!seen) items.push({ ic: "Rf", t: "Your payslip for " + r.label + " is ready", s: "Tap to open it", act: "payslip", v: p.id });
     });
   } catch (e) { /* payroll not switched on yet */ }
- 
+
   if (isMgr()) {
     const [inc, reqs, jobs, hrAll] = await Promise.all([
       sb.from("incidents").select("id").is("reviewed_at", null),
@@ -1525,7 +1525,7 @@ const payMissing = err => {
 const payOff = () => `<div class="card stack"><span class="chip warn">Not switched on yet</span>
   <div class="big">Payroll needs one database update</div>
   <p class="sm mut" style="margin:0">Open Supabase → SQL Editor, paste <b>update-3-payroll.sql</b> and press Run. Run <b>update-2.sql</b> first if you haven't yet.</p></div>`;
- 
+
 /* The lines of a payslip, in the order they are printed. Used on screen and in the PDF. */
 function slipLines(p) {
   const earn = [];
@@ -1554,7 +1554,7 @@ function missingPaySheet(people, act, label) {
     <button class="btn sec" data-act="paysetup">Enter their pay first</button>`);
 }
 const maskAcct = a => a ? (String(a).length > 4 ? "****" + String(a).slice(-4) : String(a)) : "";
- 
+
 /* ---- the Payroll screen (Manage → Payroll) ---- */
 async function viewPayroll() {
   if (!isOwner()) { S.tab = isMgr() ? "manage" : "home"; paintTabs(); return isMgr() ? viewManage() : viewHome(); }
@@ -1589,7 +1589,7 @@ async function viewPayroll() {
         <span class="sm mono">${money((byRun[r.id] || { net: 0 }).net)}</span></button>`).join("")
       || '<p class="sm mut">No months yet. Set everyone\'s pay first, then start a month.</p>'}</div>`;
 }
- 
+
 async function payRunView(back) {
   const [{ data: run, error }, { data: slips }] = await Promise.all([
     sb.from("pay_runs").select("*").eq("id", S.payRun).maybeSingle(),
@@ -1647,7 +1647,7 @@ async function payRunView(back) {
     </div>`;
   S.payRunRow = run; S.paySlips = list;
 }
- 
+
 function newRunSheet() {
   const now = new Date(todayISO() + "T12:00:00Z");
   const val = now.getUTCFullYear() + "-" + String(now.getUTCMonth() + 1).padStart(2, "0");
@@ -1701,7 +1701,7 @@ async function recalcRun(force) {
   toast(data.people + " payslips · net " + money(data.net));
   return render();
 }
- 
+
 /* ---- one payslip ---- */
 function slipHtml(p, run) {
   const { earn, ded } = slipLines(p);
@@ -1754,7 +1754,7 @@ async function slipChange(fn) {
   await slipSheet(p.id);
   payRunView().catch(() => {});   // keep the list behind in step
 }
- 
+
 /* ---- pay setup ---- */
 async function paySetupSheet() {
   const [{ data: profs, error }, { data: all }] = await Promise.all([
@@ -1826,7 +1826,7 @@ async function paySave(uid) {
   if (S.tab === "payroll" && !S.payRun) viewPayroll().catch(() => {});
   return paySetupSheet();
 }
- 
+
 /* ---- payroll rules ---- */
 async function paySettingsSheet() {
   const { data: s, error } = await sb.from("pay_settings").select("*").eq("id", 1).maybeSingle();
@@ -1866,7 +1866,7 @@ async function paySettingsSave() {
   if (error) return toast(error.message, true);
   closeSheet(); toast("Rules saved. Recalculate any draft month to apply them.");
 }
- 
+
 /* ---- any one person's payslips, any month (owner) ---- */
 function findSlipsSheet() {
   sheet(`<div style="font-weight:600;font-size:18px">Payslips by person</div>
@@ -1889,7 +1889,7 @@ async function personSlipsSheet(uid) {
       : '<p class="sm mut" style="margin:0">No payslips for this person yet.</p>'}
     <button class="btn sec" data-act="findslips">Someone else</button>`);
 }
- 
+
 /* ---- my payslips (everyone) ---- */
 async function myPayslipsSheet() {
   const { data, error } = await sb.from("payslips").select("*, pay_runs(*)").eq("user_id", S.me.id);
@@ -1912,10 +1912,10 @@ function mySlipSheet(id) {
   S.alerts = S.alerts.filter(a => !(a.act === "payslip" && a.v === id)); paintBell();
   sheet(`${slipHtml(p, p.pay_runs)}
     <button class="btn" data-act="myslippdf" data-v="${id}">Download PDF</button>
-    <p class="xs mut" style="margin:0">Something wrong? Message the manager before payday — a published payslip can be corrected and republished.</p>
+    <p class="xs mut" style="margin:0"><b>Private and confidential.</b> No signature required — this is a computer-generated document. Any discrepancies must be reported to the manager within 14 days; otherwise this payslip will be considered accurate.</p>
     <button class="btn sec" data-act="mypayslips">All my payslips</button>`);
 }
- 
+
 /* ---- PDF payslips, drawn on the phone ---- */
 let pdfLib = null, logoData = null;
 function loadPdfLib() {
@@ -1956,7 +1956,7 @@ function drawSlip(doc, p, run, logo) {
   doc.text("PAYSLIP", R, 46, { align: "right" });
   doc.setFont("helvetica", "normal"); doc.setFontSize(10); doc.setTextColor("#F1EBDD");
   doc.text(run.label || "", R, 62, { align: "right" });
- 
+
   let y = 138;
   const pair = (x, label, val) => {
     doc.setFont("helvetica", "normal"); doc.setFontSize(8); doc.setTextColor(mut); doc.text(label.toUpperCase(), x, y);
@@ -1968,7 +1968,7 @@ function drawSlip(doc, p, run, logo) {
   pair(M, "Designation", p.designation); pair(c2, "Paid by", [p.pay_method, p.bank_name, maskAcct(p.account_no)].filter(Boolean).join(" · ")); y += 36;
   pair(M, "Pay basis", p.pay_type === "hourly" ? "Hourly, " + C + " " + money(p.hourly_rate) + " an hour" : "Monthly salary");
   pair(c2, "Hours clocked", money(p.hours) + " h" + (Number(p.ot_hours) ? "  (overtime " + money(p.ot_hours) + " h)" : "")); y += 44;
- 
+
   const { earn, ded } = slipLines(p);
   const table = (title, rows, totalLabel, total) => {
     doc.setFillColor("#F4EFE4"); doc.rect(M, y - 13, R - M, 20, "F");
@@ -1988,7 +1988,7 @@ function drawSlip(doc, p, run, logo) {
   };
   table("Earnings", earn, "Gross pay", p.gross);
   if (ded.length) table("Deductions", ded, "Total deductions", p.total_deductions);
- 
+
   doc.setFillColor(gold); doc.roundedRect(M, y - 4, R - M, 44, 6, 6, "F");
   doc.setTextColor("#17140E"); doc.setFont("helvetica", "bold"); doc.setFontSize(11);
   doc.text("NET PAY", M + 14, y + 23);
@@ -1999,13 +1999,18 @@ function drawSlip(doc, p, run, logo) {
     doc.splitTextToSize("Note: " + p.note, R - M).forEach(l => { doc.text(l, M, y); y += 13; });
     y += 8;
   }
-  const foot = 780;
-  doc.setDrawColor("#9B9386"); doc.setLineWidth(0.6);
-  doc.line(M, foot - 34, M + 190, foot - 34); doc.line(R - 190, foot - 34, R, foot - 34);
-  doc.setFont("helvetica", "normal"); doc.setFontSize(8); doc.setTextColor(mut);
-  doc.text("Received by (employee)", M, foot - 22); doc.text("Authorised by", R - 190, foot - 22);
-  doc.text("Private and confidential. Questions about this payslip: speak to the manager before payday.", M, foot + 4);
-  doc.text("Generated " + fmtDayTime(new Date()) + " · La Habana Staff", M, foot + 16);
+  /* the notice at the foot of every payslip */
+  let fy = 732;
+  doc.setDrawColor(line); doc.setLineWidth(0.6); doc.line(M, fy - 16, R, fy - 16);
+  doc.setFont("helvetica", "bold"); doc.setFontSize(9); doc.setTextColor(ink);
+  doc.text("PRIVATE AND CONFIDENTIAL", M, fy); fy += 15;
+  doc.text("No signature required. This is a computer-generated document.", M, fy); fy += 15;
+  doc.setFont("helvetica", "normal"); doc.setTextColor(ink);
+  doc.text("I acknowledge receipt of my salary as per this payslip.", M, fy); fy += 15;
+  doc.splitTextToSize("Any discrepancies must be reported to the manager within 14 days; otherwise this payslip will be considered accurate.", R - M)
+    .forEach(l => { doc.text(l, M, fy); fy += 12; });
+  doc.setFontSize(7.5); doc.setTextColor(mut);
+  doc.text("Generated " + fmtDayTime(new Date()) + " · La Habana Staff", M, fy + 8);
 }
 async function slipsPdf(slips, run, filename) {
   busy(true);
@@ -2018,7 +2023,7 @@ async function slipsPdf(slips, run, filename) {
   busy(false);
 }
 const slug = s => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
- 
+
 function payCsv() {
   const run = S.payRunRow, list = S.paySlips || [];
   const head = ["Name", "Employee ID", "Designation", "Pay type", "Hours", "Overtime hours", "Basic", "Overtime", "Holiday premium",
@@ -2031,7 +2036,7 @@ function payCsv() {
   a.href = URL.createObjectURL(new Blob(["﻿" + csv], { type: "text/csv" }));
   a.download = "payroll-" + slug(run.label) + ".csv"; a.click();
 }
- 
+
 /* ---------- every tap in the app --------------------------------------- */
 document.addEventListener("click", async e => {
   const el = e.target.closest("[data-act]");
@@ -2335,5 +2340,3 @@ document.addEventListener("click", async e => {
     }
   }
 });
- 
- 
